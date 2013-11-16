@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <queue>
 #include <semaphore.h>
@@ -125,6 +126,7 @@ struct file_extents {
 
 struct inode_metadata {
   int kind; // regular, device, etc.
+  int ino;
   int uid, gid;
   int perms;
   size_t size;
@@ -142,9 +144,10 @@ struct inode_metadata {
     else throw runtime_error("unknown file kind");
     uid = st.st_uid;
     gid = st.st_gid;
+    ino = st.st_ino;
     perms = st.st_mode & 0xffff;
     size = st.st_size;
-    devno = st.st_dev;
+    devno = st.st_rdev;
     atime = st.st_atime;
     mtime = st.st_mtime;
     ctime = st.st_ctime;
@@ -229,7 +232,43 @@ struct inode_metadata {
   }
   char *xattr(const string &s) { return xattr(s.c_str()); }
   const char *xattr(const string &s) const { return xattr(s.c_str()); }
+  int nxattrs() const { return xattr_name_idx.size(); }
 };
+
+struct s_inode_metadata_hdr {
+  char kind;
+  ino_t ino;
+  int uid, gid;
+  unsigned short perms;
+  time_t atime, ctime, mtime;
+} __attribute__((packed));
+
+string serialise(const inode_metadata &md) {
+  s_inode_metadata_hdr h;
+  h.kind = md.kind;
+  h.ino = md.ino;
+  h.uid = md.uid;
+  h.gid = md.gid;
+  h.perms = md.perms;
+  h.atime = md.atime;
+  h.ctime = md.ctime;
+  h.mtime = md.mtime;
+  string ans((char *)&h, (char *)(&h+1));
+  if (h.kind == 2 || h.kind == 3) {
+    ans += md.devno & 255;
+    ans += md.devno >> 8 & 255;
+  }
+  string xattrs;
+  FOR(i, md.nxattrs()) {
+    xattrs += md.xattr_name(i);
+    xattrs += '\0';
+    xattrs += md.xattr_val(i);
+    xattrs += '\0';
+  }
+  unsigned int siz = xattrs.size();
+  FOR(i, 4) ans += siz & 255, siz >>= 8;
+  return ans + xattrs;
+}
 
 static const int threads = 64;
 
@@ -267,13 +306,7 @@ struct dirtree_walker {
     pushit(0, [](){return 0;});
   }
 
-  void handle_unk(string s, ino_t myino) {
-    if (scan_directory(s, myino)) handle_file(s, myino);
-  }
-
-  int handle_file(string s, ino_t myino) {
-    return 0;
-  }
+  function<void(const string &, const inode_metadata &)> handler;
 
   struct dir_raii {
     DIR *d;
@@ -306,33 +339,9 @@ struct dirtree_walker {
       ino_t ino = de.d_ino;
       try {
         inode_metadata md(name.c_str());
-        if (md.kind == 1) {
-          printf("mkdir %s\n", name.c_str());
+        if (md.kind == 1)
           pushit(ino,[name,ino,this]{scan_directory(name,ino);});
-        } else if (md.kind == 2) {
-          printf("nod c %s %i\n", name.c_str(), md.devno);
-        } else if (md.kind == 3) {
-          printf("nod b %s %i\n", name.c_str(), md.devno);
-        } else if (md.kind == 4) {
-          printf("fifo %s\n", name.c_str());
-        } else if (md.kind == 5) {
-          char buf[8192];
-          while (1) {
-            int len = readlink(name.c_str(), buf, 8190);
-            if (len < 0) {
-              if (errno == EINTR) continue;
-              throw runtime_error(strprintf("readlink(%s): %s", name.c_str(),
-                  strerror(errno)));
-            }
-            buf[len] = 0;
-            break;
-          }
-          printf("lnk %s %s\n", name.c_str(), buf);
-        } else if (md.kind == 6) {
-          printf("sock %s\n", name.c_str());
-        } else if (md.kind == 0) {
-          printf("file %s\n", name.c_str());
-        } else throw runtime_error(strprintf("weird kind %i", md.kind));
+        handler(name, md);
       } catch (exception &e) {
         fprintf(stderr, "while processing %s: %s\n", name.c_str(), e.what());
         throw e;
@@ -356,7 +365,96 @@ struct dirtree_walker {
   }
 };
 
+struct outputter {
+  mutex mu;
+  condition_variable qempty, qfull;
+  queue<string> q;
+  int totsiz;
+  int done;
+
+  outputter() {
+    totsiz = 0;
+    done = 0;
+  }
+
+  void push(const string &s) {
+    unique_lock<mutex> lg(mu);
+    while (totsiz > (64<<20)) qfull.wait(lg);
+    q.push(s);
+    totsiz += s.size();
+    qempty.notify_all();
+  }
+
+  void go() {
+    while (1) {
+      string s;
+      { unique_lock<mutex> lg(mu);
+        while (!q.size()) {
+          qempty.wait(lg);
+          if (done) return;
+        }
+        s = move(q.front());
+        q.pop();
+        totsiz -= s.size();
+      }
+      dowrite(&s[0], s.size());
+      qfull.notify_all();
+    }
+  }
+
+  static void dowrite(const char *p, int sz) {
+    while (sz) {
+      int len = write(1, p, sz);
+      if (len < 0) {
+        if (errno == EINTR) continue;
+        else throw runtime_error(strprintf("outputter couldn't output: %s",
+            strerror(errno)));
+      }
+      p += len;
+      sz -= len;
+    }
+  }
+} output;
+
+void enqueue_block(const string &s) {
+  output.push(s);
+}
+
+void handle_dent(const string &name, const inode_metadata &md) {
+  switch (md.kind) {
+    case 1: case 2: case 3: case 4: case 6: {
+      enqueue_block(serialise(md));
+    } break;
+    case 5: {
+      string foo = serialise(md);
+      char buf[8192];
+      while (1) {
+        int len = readlink(name.c_str(), buf, 8192);
+        if (len < 0) {
+          if (errno == EINTR) continue;
+          throw runtime_error(strprintf("readlink(%s): %s", name.c_str(),
+              strerror(errno)));
+        }
+        int k = len;
+        FOR(i, 4) foo += k, k >>= 8;
+        foo += string(buf, buf + len);
+        break;
+      }
+      enqueue_block(foo);
+    } break;
+    case 0: {
+      enqueue_block(serialise(md));
+    } break;
+    default: throw runtime_error(strprintf("weird kind %i", md.kind));
+  }
+}
+
 int main(int argc, char **argv) {
+  thread out([](){output.go();});
   dirtree_walker w(argv[1]);
+  w.handler = handle_dent;
   w.go();
+  output.done = 1;
+  output.qempty.notify_all();
+  out.join();
 }
