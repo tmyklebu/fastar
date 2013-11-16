@@ -19,6 +19,10 @@
 #include <atomic>
 #include <queue>
 #include <semaphore.h>
+#include <linux/fs.h>
+#include <linux/fiemap.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
 using namespace std;
 
 #define FOR(i,n) for (int i=0;i<n;i++)
@@ -58,6 +62,66 @@ string strprintf(const char *fmt, ...) {
   free(buf);
   return ans;
 }
+
+struct ffextent {
+  ffextent(bool a, bool l, uint64_t o, uint64_t le)
+    : aligned(a), last(l), off(o), len(le) { };
+  bool aligned, last;
+  uint64_t off, len;
+};
+
+struct file_extents {
+  std::vector<ffextent> extents;
+
+  file_extents(int fd) {
+    struct fiemap extinfo;
+    memset(&extinfo, 0, sizeof(struct fiemap));
+
+    extinfo.fm_start = 0;
+    extinfo.fm_length = ~0;
+    extinfo.fm_extent_count = 0;
+
+    while(ioctl(fd, FS_IOC_FIEMAP, &extinfo) < 0) {
+      if(errno != EINTR)
+        throw runtime_error(strprintf("FS_IOC_FIEMAP failed: %s", strerror(errno)));
+    }
+
+    while(1) {
+      struct fiemap * exts = (struct fiemap *)
+        alloca(sizeof(struct fiemap) + sizeof(struct fiemap_extent) * extinfo.fm_mapped_extents);
+      memset(exts, 0, sizeof(struct fiemap));
+
+      exts->fm_start = 0;
+      exts->fm_length = ~0;
+      exts->fm_extent_count = extinfo.fm_mapped_extents;
+
+      while(ioctl(fd, FS_IOC_FIEMAP, exts) < 0) {
+        if(errno != EINTR)
+          throw runtime_error(strprintf("FS_IOC_FIEMAP failed: %s", strerror(errno)));
+      }
+      if(!(exts->fm_extents[exts->fm_mapped_extents-1].fe_flags & FIEMAP_EXTENT_LAST))
+        continue;
+
+      extents.reserve(exts->fm_mapped_extents);
+      for(uint32_t i = 0; i < exts->fm_mapped_extents; i++) {
+        struct fiemap_extent * e = exts->fm_extents + i;
+        if(e->fe_flags & (FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC
+            | FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED
+            | FIEMAP_EXTENT_UNWRITTEN))
+        {
+          throw runtime_error(strprintf("bogus extent: %u", e->fe_flags));
+        }
+        extents.push_back(
+            ffextent(!(e->fe_flags & FIEMAP_EXTENT_NOT_ALIGNED),
+              e->fe_flags & FIEMAP_EXTENT_LAST,
+              e->fe_physical,
+              e->fe_length));
+      }
+      break;
+    }
+  }
+};
+
 
 struct inode_metadata {
   int kind; // regular, device, etc.
@@ -174,14 +238,14 @@ struct dirtree_walker {
   multimap<int, function<void()> > q;
   semaphore qsize;
   atomic<int> energy;
-  
+
   void pushit(int key, function<void()> f) {
     lock_guard<mutex> g(mu);
     q.insert(make_pair(key, f));
     qsize.post();
     ++energy;
   }
-  
+
   void processing_thread() {
     int lastino = 0;
     while (energy != 0) {
@@ -199,36 +263,36 @@ struct dirtree_walker {
       f();
       --energy;
     }
-  
+
     pushit(0, [](){return 0;});
   }
-  
+
   void handle_unk(string s, ino_t myino) {
     if (scan_directory(s, myino)) handle_file(s, myino);
   }
-  
+
   int handle_file(string s, ino_t myino) {
     return 0;
   }
-  
+
   struct dir_raii {
     DIR *d;
     dir_raii(DIR *d) : d(d) {}
     ~dir_raii() { closedir(d); }
   };
-  
+
   int scan_directory(string dir, ino_t myino) {
     DIR *d = opendir(dir.c_str());
     if (!d) {
       fprintf(stderr, "opendir(%s): %s\n", dir.c_str(), strerror(errno));
       return -1;
     }
-  
+
     dir_raii raii(d);
-  
+
     dirent de;
     dirent *res;
-  
+
     while (1) {
       int st = readdir_r(d, &de, &res);
       if (st)
@@ -237,7 +301,7 @@ struct dirtree_walker {
       if (!res) break;
       if (!strcmp(de.d_name, ".")) continue;
       if (!strcmp(de.d_name, "..")) continue;
-  
+
       string name = dir + "/" + de.d_name;
       ino_t ino = de.d_ino;
       try {
@@ -274,7 +338,7 @@ struct dirtree_walker {
         throw e;
       }
     }
-  
+
     return 0;
   }
 
