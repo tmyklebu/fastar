@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <attr/xattr.h>
 #include <stdexcept>
 #include <vector>
@@ -30,6 +31,9 @@
 using namespace std;
 
 #define FOR(i,n) for (int i=0;i<n;i++)
+
+template <typename T>
+unique_ptr<T> make_unique(T *t) { return unique_ptr<T>(t); }
 
 struct semaphore {
   sem_t sem;
@@ -385,10 +389,34 @@ struct dirtree_walker {
   }
 };
 
+struct pending_output {
+  virtual vector<iovec> get_iovec() = 0;
+  virtual ~pending_output() {}
+};
+
+struct pending_string_output : pending_output {
+  string s;
+  pending_string_output(const string &s) : s(s) {}
+
+  vector<iovec> get_iovec() {
+    vector<iovec> iov(1);
+    iov[0].iov_base = &s[0];
+    iov[0].iov_len = s.size();
+    return iov;
+  }
+};
+
+struct pending_iovec_output : pending_output {
+  vector<iovec> v;
+  pending_iovec_output(const vector<iovec> &v) : v(v) {}
+
+  vector<iovec> get_iovec() { return v; }
+};
+
 struct outputter {
   mutex mu;
   condition_variable qempty, qfull;
-  queue<string> q;
+  queue<unique_ptr<pending_output> > q;
   int totsiz;
   atomic<int> done;
 
@@ -400,46 +428,63 @@ struct outputter {
   void push(const string &s) {
     unique_lock<mutex> lg(mu);
     while (totsiz > (64<<20)) qfull.wait(lg);
-    q.push(s);
+    q.push(unique_ptr<pending_output>(new pending_string_output(s)));
     totsiz += s.size();
+    qempty.notify_all();
+  }
+
+  void push(const vector<iovec> &iov) {
+    unique_lock<mutex> lg(mu);
+    while (totsiz > (64<<20)) qfull.wait(lg);
+    q.push(unique_ptr<pending_output>(new pending_iovec_output(iov)));
+    FOR(i, iov.size()) totsiz += iov[i].iov_len;
     qempty.notify_all();
   }
 
   void go() {
     while (1) {
-      string s;
+      unique_ptr<pending_output> po;
+      vector<iovec> iov;
       { unique_lock<mutex> lg(mu);
         while (!q.size()) {
           if (done) return;
           qempty.wait(lg);
         }
-        s = move(q.front());
+        po = move(q.front());
         q.pop();
-        totsiz -= s.size();
+        iov = po->get_iovec();
+        FOR(i, iov.size()) totsiz -= iov[i].iov_len;
       }
-      FOR(i,s.size()) if (s[i] != '\n' && s[i] < ' ' || s[i] > 'z')
-        s[i] = '?';
-      dowrite(&s[0], s.size());
+      dowritev(iov);
       qfull.notify_all();
     }
   }
 
-  static void dowrite(const char *p, int sz) {
-    while (sz) {
-      int len = write(1, p, sz);
+  static void dowritev(vector<iovec> v) {
+    iovec *vec = &v[0];
+    int vecs = v.size();
+    while (vecs) {
+      ssize_t len = writev(1, vec, vecs);
       if (len < 0) {
         if (errno == EINTR) continue;
-        else throw runtime_error(strprintf("outputter couldn't output: %s",
+        throw runtime_error(strprintf("outputter couldn't output: %s",
             strerror(errno)));
       }
-      p += len;
-      sz -= len;
+      while (len >= vec[0].iov_len) vecs--, len -= vec[0].iov_len, vec++;
+      if (len) {
+        vec[0].iov_len -= len;
+        vec[0].iov_base = (char *)vec[0].iov_base + len;
+      }
     }
   }
 } output;
 
 void enqueue_block(const string &s) {
   output.push(s);
+}
+
+void enqueue_iovec(const vector<iovec> &v) {
+  output.push(v);
 }
 
 namespace std {
