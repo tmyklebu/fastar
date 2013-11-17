@@ -28,6 +28,7 @@
 #include <linux/fiemap.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
+#include <utime.h>
 using namespace std;
 
 #define FOR(i,n) for (int i=0;i<n;i++)
@@ -142,7 +143,6 @@ struct file_extents {
   }
 };
 
-
 struct inode_metadata {
   int kind; // regular, device, etc.
   int ino;
@@ -226,6 +226,38 @@ struct inode_metadata {
 
   inode_metadata() {}
 
+#define SAFE_SYSCALL(f, p, ...) do {\
+  while(f(p, ##__VA_ARGS__) < 0) {\
+    if(errno != EINTR) {\
+      throw runtime_error(strprintf("%s(%s): %s", #f, p, strerror(errno)));\
+    }\
+  }\
+} while(0)
+
+  void restore(const char *path, const char *maybe_linktarget) {
+    mode_t kind2S_[] = { S_IFREG, 0, S_IFCHR, S_IFBLK, S_IFIFO, 0, S_IFSOCK };
+    switch(kind) {
+      case 0: case 2: case 3: case 4: case 6:
+        SAFE_SYSCALL(mknod, path, kind2S_[kind], devno);
+        if(kind == 0) {
+          SAFE_SYSCALL(truncate, path, (off_t)size);
+        }
+        break;
+      case 1:
+        SAFE_SYSCALL(mkdir, path, 0);
+        break;
+      case 5:
+        SAFE_SYSCALL(symlink, path, maybe_linktarget);
+        break;
+    }
+    SAFE_SYSCALL(chmod, path, (mode_t)perms);
+    SAFE_SYSCALL(lchown, path, (uid_t)uid, (gid_t)gid);
+    struct utimbuf tb;
+    tb.actime = atime;
+    tb.modtime = mtime;
+    SAFE_SYSCALL(utime, path, &tb);
+  }
+
   char *xattr_name(int i) {
     return &_xattr_data[xattr_name_idx[i]];
   }
@@ -286,6 +318,28 @@ string serialise(const inode_metadata &md) {
   unsigned int siz = xattrs.size();
   FOR(i, 4) ans += siz & 255, siz >>= 8;
   return ans + xattrs;
+}
+
+inode_metadata deserialise(const string & s) {
+  const s_inode_metadata_hdr & h = *(s_inode_metadata_hdr*)&s[0];
+  char * cdr = &s[0] + sizeof(s_inode_metadata_hdr);
+  inode_metadata md;
+  md.kind = h.kind;
+  md.ino = h.ino;
+  md.uid = h.uid;
+  md.gid = h.gid;
+  md.perms = h.perms;
+  md.atime = h.atime;
+  md.ctime = h.ctime;
+  md.mtime = h.mtime;
+  if (h.kind == 2 || h.kind == 3) {
+    md.devno = cdr[1] << 8 | cdr[0];
+    cdr += 2;
+  }
+  int xattrs_siz = 0;
+  FOR(i, 4) xattrs_siz |= cdr[0] << (8*i), cdr++;
+  string xattrs(cdr, cdr+xattrs_siz);
+  // TODO restore xattrs.
 }
 
 static const int threads = 64;
@@ -527,7 +581,7 @@ struct data_grabber {
     }
     fd_raii raii(fd);
     while (lseek(fd, p.off, SEEK_SET) < 0) {
-      if (errno != EINTR) 
+      if (errno != EINTR)
         throw runtime_error(strprintf("lseek: %s", strerror(errno)));
     }
     if (0)
