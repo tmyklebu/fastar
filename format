@@ -44,7 +44,7 @@ hardlink:
   lenprestring to
 
 data:
-  char 'd'
   lenprestring filename
+  char 'd'
   int64 off
   lenprestring data
