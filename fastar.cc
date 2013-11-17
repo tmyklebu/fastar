@@ -264,6 +264,15 @@ struct inode_metadata {
     tb.actime = atime;
     tb.modtime = mtime;
     SAFE_SYSCALL(utime, path, &tb);
+    if(xattr_val_idx.size() != xattr_name_idx.size()) {
+      throw runtime_error("restore: xattr_name_idx and xattr_val_idx have differing sizes");
+    }
+    FOR(i, xattr_name_idx.size())
+      SAFE_SYSCALL(lsetxattr, path,
+          &_xattr_data[xattr_name_idx.size()],
+          &_xattr_data[xattr_val_idx.size()],
+          strlen(&_xattr_data[xattr_val_idx.size()]), 0);
+
   }
 
   char *xattr_name(int i) {
@@ -330,7 +339,7 @@ string serialise(const inode_metadata &md) {
 
 inode_metadata deserialise(const string & s) {
   const s_inode_metadata_hdr & h = *(s_inode_metadata_hdr*)&s[0];
-  char * cdr = &s[0] + sizeof(s_inode_metadata_hdr);
+  const char * cdr = &s[0] + sizeof(s_inode_metadata_hdr);
   inode_metadata md;
   md.kind = h.kind;
   md.ino = h.ino;
@@ -346,8 +355,20 @@ inode_metadata deserialise(const string & s) {
   }
   int xattrs_siz = 0;
   FOR(i, 4) xattrs_siz |= cdr[0] << (8*i), cdr++;
-  string xattrs(cdr, cdr+xattrs_siz);
-  // TODO restore xattrs.
+  int start = 0;
+  bool iskey = true;
+  FOR(i, xattrs_siz) {
+    if(cdr[i] == '\0') {
+      if(iskey) {
+        md.xattr_name_idx.push_back(start);
+      } else {
+        md.xattr_val_idx.push_back(start);
+      }
+      start = i+1;
+      iskey = ~iskey;
+    }
+  }
+  md._xattr_data.assign(cdr, cdr+xattrs_siz);
 }
 
 static const int threads = 64;
@@ -480,7 +501,7 @@ struct pending_datapkt_output : pending_output {
   char *data;
   int off;
   size_t datalen;
-  
+
   pending_datapkt_output(const string &hdr, char *payload, int off, size_t len)
     : hdr(hdr), data(payload), off(off), datalen(len) {}
 
