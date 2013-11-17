@@ -872,7 +872,13 @@ void restore_data(string filename, FILE *f) {
       char buf[65536];
       int zzz = min(65536, datalen);
       int len = fread(buf, 1, zzz, f);
-      // TODO: error check.
+      if (len != zzz) {
+        if (feof(f)) 
+          throw runtime_error("fread came up short during data block "
+              "read: unexpected eof");
+        throw runtime_error(strprintf("fread came up short during data block "
+            "read: %s", strerror(errno)));
+      }
       datalen -= len;
       char *p = buf;
       while (len) {
