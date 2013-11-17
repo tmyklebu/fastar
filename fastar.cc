@@ -256,10 +256,8 @@ struct inode_metadata {
     mode_t kind2S_[] = { S_IFREG, 0, S_IFCHR, S_IFBLK, S_IFIFO, 0, S_IFSOCK };
     switch(kind) {
       case 0: case 2: case 3: case 4: case 6:
+        if (kind != 2 && kind != 3) devno = 0;
         SAFE_SYSCALL(mknod, path, kind2S_[kind], devno);
-        if(kind == 0) {
-          SAFE_SYSCALL(truncate, path, (off_t)size);
-        }
         break;
       case 1:
         SAFE_SYSCALL(mkdir, path, 0);
@@ -267,9 +265,14 @@ struct inode_metadata {
       case 5:
         SAFE_SYSCALL(symlink, path, maybe_linktarget);
         break;
+      default:
+        throw runtime_error("weird kind");
     }
     SAFE_SYSCALL(chmod, path, (mode_t)perms);
     SAFE_SYSCALL(lchown, path, (uid_t)uid, (gid_t)gid);
+    if(kind == 0) {
+      SAFE_SYSCALL(truncate, path, (off_t)size);
+    }
     struct utimbuf tb;
     tb.actime = atime;
     tb.modtime = mtime;
@@ -322,6 +325,7 @@ struct s_inode_metadata_hdr {
   char kind;
   ino_t ino;
   int uid, gid;
+  size_t size;
   unsigned short perms;
   time_t atime, ctime, mtime;
 } __attribute__((packed));
@@ -336,6 +340,7 @@ string serialise(const inode_metadata &md) {
   h.atime = md.atime;
   h.ctime = md.ctime;
   h.mtime = md.mtime;
+  h.size = md.size;
   string ans((char *)&h, (char *)&h + sizeof(s_inode_metadata_hdr));
   if (h.kind == 2 || h.kind == 3) {
     ans += md.devno & 255;
@@ -364,6 +369,7 @@ inode_metadata deserialise(const string & s) {
   md.atime = h.atime;
   md.ctime = h.ctime;
   md.mtime = h.mtime;
+  md.size = h.size;
   if (h.kind == 2 || h.kind == 3) {
     md.devno = cdr[1] << 8 | cdr[0];
     cdr += 2;
@@ -754,14 +760,14 @@ struct data_grabber {
     // TODO
   }
 
-  void add(const string &name, const inode_metadata &md) {
+  int add(const string &name, const inode_metadata &md) {
     { lock_guard<mutex> lg(mu);
       if (inode_canon.count(md.ino)) {
         // hard links
-        string block = "\007";
-        block += length_prefixed(name) + length_prefixed(inode_canon[md.ino]);
+        string block = length_prefixed(name) + "\007"
+            + length_prefixed(inode_canon[md.ino]);
         enqueue_block(block);
-        return;
+        return 1;
       }
       inode_canon[md.ino] = name;
     }
@@ -773,7 +779,7 @@ struct data_grabber {
       if (errno == EACCES) {
         fprintf(stderr, "warning: open(%s): %s\n", name.c_str(),
             strerror(errno));
-        return;
+        return 0;
       }
       throw runtime_error(strprintf("open(%s): %s", name.c_str(),
           strerror(errno)));
@@ -784,7 +790,7 @@ struct data_grabber {
       size_t totlen = 0;
       FOR(i, ext.extents.size()) totlen += ext.extents[i].len;
       if (totlen == 0) {
-        return;
+        return 0;
       }
       if (totlen > (32<<20)) {
         lock_guard<mutex> lg(mu);
@@ -799,6 +805,7 @@ struct data_grabber {
       fprintf(stderr, "warning: failed to fetch extents for %s: %s\n",
            name.c_str(), e.what());
     }
+    return 0;
   }
 } grab;
 
@@ -824,27 +831,36 @@ void handle_dent(const string &name, const inode_metadata &md) {
       enqueue_block(foo);
     } break;
     case 0: {
-      enqueue_block(prefix + serialise(md));
-      grab.add(name, md);
+      if (!grab.add(name, md))
+        enqueue_block(prefix + serialise(md));
     } break;
     default: throw runtime_error(strprintf("weird kind %i", md.kind));
   }
 }
 
-struct eof_exception : exception {
-};
+struct eof_exception : exception {};
 
+int bytes_read = 0;
 #define FREAD(targ,len,nmemb) do { \
+        int rv = fread(targ, len, nmemb, f); \
+        if (rv != nmemb) { \
+          if (feof(f)) abort(); throw runtime_error("unexpected eof"); \
+          throw runtime_error(strprintf("fread: %s", strerror(errno))); \
+        } \
+        bytes_read += rv * nmemb; \
+      } while (0)
+#define FREAD_EOF(targ,len,nmemb) do { \
         int rv = fread(targ, len, nmemb, f); \
         if (rv != nmemb) { \
           if (feof(f)) throw eof_exception(); \
           throw runtime_error(strprintf("fread: %s", strerror(errno))); \
         } \
+        bytes_read += rv * nmemb; \
       } while (0)
 
 string read_lenprestring(FILE *f) {
   int len;
-  FREAD(&len, 1, 4);
+  FREAD_EOF(&len, 1, 4);
   string s(len, '\0');
   FREAD(&s[0], 1, len);
   return s;
@@ -863,12 +879,11 @@ inode_metadata handle_special_file(char kind, FILE * f) {
 
   string lps = read_lenprestring(f);
   string allbfr = string(bfr1, p) + int2string(lps.size()) + lps;
-  fprintf(stderr, "%i\n", allbfr.size());
 
   return deserialise(allbfr);
 }
 
-bool dry_run = true;
+bool dry_run = false;
 
 void restore_data(string filename, FILE *f) {
   unsigned long long offset;
@@ -877,7 +892,6 @@ void restore_data(string filename, FILE *f) {
   FREAD(&datalen, 4, 1);
 
   if (!dry_run) {
-    abort();
     sadface:
     int fd = open(filename.c_str(), O_WRONLY);
     if (fd < 0) {
@@ -891,7 +905,8 @@ void restore_data(string filename, FILE *f) {
     while (datalen) {
       char buf[65536];
       int zzz = min(65536, datalen);
-      int len = fread(buf, zzz, 1, f);
+      int len = fread(buf, 1, zzz, f);
+      // TODO: error check.
       datalen -= len;
       char *p = buf;
       while (len) {
@@ -921,36 +936,27 @@ void restore_data(string filename, FILE *f) {
 
 void restore(FILE *f) {
   while (1) {
-    char c;
+    int c;
     string from = read_lenprestring(f);
     switch ((c = getc(f))) {
-      case EOF: break;
-      case 0: {
+      case 0: case 1: case 2: case 3: case 4: case 6: {
         inode_metadata md = handle_special_file(c, f);
-        printf("file %s\n", from.c_str());
+        md.restore(from.c_str(), 0);
       } break;
-      case 1:  {
-        inode_metadata md = handle_special_file(c, f);
-        printf("dir %s\n", from.c_str());
-      } break;
-      case 2: case 3: case 4: case 6: {
-        inode_metadata md = handle_special_file(c, f);
-        printf("weird-file %s\n", from.c_str());
-      } break;
-      case 5: { // symlink
+      case 5: {
         inode_metadata md = handle_special_file(c, f);
         string to = read_lenprestring(f);
-        printf("symlink from %s to %s\n", from.c_str(), to.c_str());
+        md.restore(from.c_str(), to.c_str());
       } break;
       case 7: { // hardlink
         string to = read_lenprestring(f);
-        printf("hardlink from %s to %s\n", from.c_str(), to.c_str());
+        SAFE_SYSCALL0(link, to.c_str(), from.c_str());
       } break;
       case 'd': { // data block
         restore_data(from, f);
       } break;
       default:
-        throw runtime_error(strprintf("bogus type 0x%hhx", c));
+        throw runtime_error(strprintf("bogus type 0x%x", c));
     }
   }
 }
