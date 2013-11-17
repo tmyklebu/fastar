@@ -734,7 +734,6 @@ void handle_dent(const string &name, const inode_metadata &md) {
 }
 
 int main(int argc, char **argv) {
-  //freopen("/dev/null", "w", stdout);
   thread out([](){output.go();});
   dirtree_walker w(argv[1]);
   w.handler = handle_dent;
