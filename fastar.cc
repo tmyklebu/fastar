@@ -836,7 +836,7 @@ string read_lenprestring(FILE *f) {
   return s;
 }
 
-inode_metadata handle_special_file(char kind, FILE * f) {
+inode_metadata get_inode_md(char kind, FILE * f) {
   ungetc(kind, f);
   char bfr1[sizeof(s_inode_metadata_hdr) + 6];
   char * p = bfr1;
@@ -919,7 +919,7 @@ void restore(FILE *f) {
     string from = read_lenprestring(f);
     switch ((c = getc(f))) {
       case 0: case 1: {
-        inode_metadata md = handle_special_file(c, f);
+        inode_metadata md = get_inode_md(c, f);
         md.restore(from.c_str(), 0);
         utimbuf tb;
         tb.actime = md.atime;
@@ -927,11 +927,11 @@ void restore(FILE *f) {
         time_fixup_list.push_back(make_pair(from, tb));
       } break;
       case 2: case 3: case 4: case 6: {
-        inode_metadata md = handle_special_file(c, f);
+        inode_metadata md = get_inode_md(c, f);
         md.restore(from.c_str(), 0);
       } break;
       case 5: {
-        inode_metadata md = handle_special_file(c, f);
+        inode_metadata md = get_inode_md(c, f);
         string to = read_lenprestring(f);
         md.restore(from.c_str(), to.c_str());
       } break;
