@@ -74,6 +74,9 @@ string int2string(int sz) {
   string p((char *)&sz, (char *)(&sz+1));
   return p;
 }
+int string2int(const string &s) {
+  return *(int *)&s[0];
+}
 string ll2string(long long sz) {
   string p((char *)&sz, (char *)(&sz+1));
   return p;
@@ -333,7 +336,7 @@ string serialise(const inode_metadata &md) {
   h.atime = md.atime;
   h.ctime = md.ctime;
   h.mtime = md.mtime;
-  string ans((char *)&h, (char *)(&h+1));
+  string ans((char *)&h, (char *)&h + sizeof(s_inode_metadata_hdr));
   if (h.kind == 2 || h.kind == 3) {
     ans += md.devno & 255;
     ans += md.devno >> 8 & 255;
@@ -345,13 +348,12 @@ string serialise(const inode_metadata &md) {
     xattrs += md.xattr_val(i);
     xattrs += '\0';
   }
-  unsigned int siz = xattrs.size();
-  FOR(i, 4) ans += siz & 255, siz >>= 8;
-  return ans + xattrs;
+  ans += length_prefixed(xattrs);
+  return ans;
 }
 
 inode_metadata deserialise(const string & s) {
-  const s_inode_metadata_hdr & h = *(s_inode_metadata_hdr*)&s[0];
+  const s_inode_metadata_hdr &h = *(s_inode_metadata_hdr*)&s[0];
   const char *cdr = &s[0] + sizeof(s_inode_metadata_hdr);
   inode_metadata md;
   md.kind = h.kind;
@@ -366,8 +368,8 @@ inode_metadata deserialise(const string & s) {
     md.devno = cdr[1] << 8 | cdr[0];
     cdr += 2;
   }
-  int xattrs_siz = 0;
-  FOR(i, 4) xattrs_siz |= cdr[0] << (8*i), cdr++;
+  int xattrs_siz = string2int(string(cdr, cdr+4));
+  cdr += 4;
   int start = 0;
   bool iskey = true;
   FOR(i, xattrs_siz) {
@@ -381,28 +383,13 @@ inode_metadata deserialise(const string & s) {
       iskey = ~iskey;
     }
   }
-  md._xattr_data.assign(cdr, cdr+xattrs_siz);
-}
-
-inode_metadata handle_special_file(char kind, FILE * f) {
-  char bfr1[sizeof(s_inode_metadata_hdr) + 6];
-  char * p = bfr1;
-  FREAD(p, sizeof(s_inode_metadata_hdr), 1);
-  p += sizeof(s_inode_metadata_hdr);
-  if(kind == 2 || kind == 3) {
-    FREAD(p, 1, 2);
-    p += 2;
+  if (xattrs_siz) {
+    fprintf(stderr, "%p %p\n", &s[0], &md._xattr_data[0]);
+    exit(0);
+    md._xattr_data.resize(xattrs_siz);
+    memcpy(&md._xattr_data[0], cdr, xattrs_siz);
   }
-  FREAD(p, 1, 4);
-
-  int xattrs_siz = 0;
-  FOR(i, 4) xattrs_siz |= p[0] << (8*i), p++;
-
-  char * bfr2 = (char*)alloca(xattrs_siz);
-  FREAD(bfr2, 1, xattrs_siz);
-
-  string allbfr = string(bfr1, p) + string(bfr2, bfr2+xattrs_siz);
-  return deserialise(allbfr);
+  return md;
 }
 
 static const int threads = 64;
@@ -701,8 +688,8 @@ struct data_grabber {
 
     argh.release();
     string hdr;
-    hdr = "d";
     hdr += length_prefixed(p.file);
+    hdr += "d";
     hdr += ll2string(p.off);
     hdr += int2string(fub-buf);
     enqueue_datapkt(hdr, _buf, buf-_buf, fub-buf);
@@ -831,9 +818,7 @@ void handle_dent(const string &name, const inode_metadata &md) {
           throw runtime_error(strprintf("readlink(%s): %s", name.c_str(),
               strerror(errno)));
         }
-        int k = len;
-        FOR(i, 4) foo += k, k >>= 8;
-        foo += string(buf, buf + len);
+        foo += length_prefixed(string(buf, buf+len));
         break;
       }
       enqueue_block(foo);
@@ -846,82 +831,123 @@ void handle_dent(const string &name, const inode_metadata &md) {
   }
 }
 
-void restore_data(FILE *f) {
-  int fnamelen;
+struct eof_exception : exception {
+};
+
 #define FREAD(targ,len,nmemb) do { \
-      if (1 != fread(targ, len, nmemb, f)) \
-        throw runtime_error(strprintf("fread: %s", strerror(errno))); \
+        int rv = fread(targ, len, nmemb, f); \
+        if (rv != nmemb) { \
+          if (feof(f)) throw eof_exception(); \
+          throw runtime_error(strprintf("fread: %s", strerror(errno))); \
+        } \
       } while (0)
-  FREAD(&fnamelen, 4, 1);
-  string filename(fnamelen, '\0');
-  FREAD((char *)filename.data(), 1, fnamelen);
-  unsigned long long offset;
-  FREAD(&offset, 8, 1);
-  int datalen;
-  FREAD(&datalen, 8, 1);
-
-  sadface:
-  int fd = open(filename.c_str(), O_WRONLY);
-  if (fd < 0) {
-    if (errno == EINTR) goto sadface;
-    throw runtime_error(strprintf("open(%s): %s", filename.c_str(),
-        strerror(errno)));
-  }
-  fd_raii raii(fd);
-  SAFE_SYSCALL0(lseek, fd, offset, SEEK_SET);
-
-  while (datalen) {
-    char buf[33554432];
-    int zzz = min(33554432, datalen);
-    int len = fread(buf, zzz, 1, f);
-    datalen -= len;
-    char *p = buf;
-    while (len) {
-      int rit = write(fd, p, len);
-      if (rit < 0) {
-        if (errno == EINTR) continue;
-        throw runtime_error(strprintf("write: %s", strerror(errno)));
-      }
-      if (!rit) {
-        fprintf(stderr, "write() unexpectedly returned 0\n");
-        return;
-      }
-      p += rit;
-      len -= rit;
-    }
-  }
-}
 
 string read_lenprestring(FILE *f) {
   int len;
-  FREAD(&len, 4, 1);
+  FREAD(&len, 1, 4);
   string s(len, '\0');
   FREAD(&s[0], 1, len);
   return s;
 }
 
+inode_metadata handle_special_file(char kind, FILE * f) {
+  ungetc(kind, f);
+  char bfr1[sizeof(s_inode_metadata_hdr) + 6];
+  char * p = bfr1;
+  FREAD(p, sizeof(s_inode_metadata_hdr), 1);
+  p += sizeof(s_inode_metadata_hdr);
+  if(kind == 2 || kind == 3) {
+    FREAD(p, 1, 2);
+    p += 2;
+  }
+
+  string lps = read_lenprestring(f);
+  string allbfr = string(bfr1, p) + int2string(lps.size()) + lps;
+  fprintf(stderr, "%i\n", allbfr.size());
+
+  return deserialise(allbfr);
+}
+
+bool dry_run = true;
+
+void restore_data(string filename, FILE *f) {
+  unsigned long long offset;
+  FREAD(&offset, 8, 1);
+  int datalen;
+  FREAD(&datalen, 4, 1);
+
+  if (!dry_run) {
+    abort();
+    sadface:
+    int fd = open(filename.c_str(), O_WRONLY);
+    if (fd < 0) {
+      if (errno == EINTR) goto sadface;
+      throw runtime_error(strprintf("open(%s): %s", filename.c_str(),
+          strerror(errno)));
+    }
+    fd_raii raii(fd);
+    SAFE_SYSCALL0(lseek, fd, offset, SEEK_SET);
+  
+    while (datalen) {
+      char buf[65536];
+      int zzz = min(65536, datalen);
+      int len = fread(buf, zzz, 1, f);
+      datalen -= len;
+      char *p = buf;
+      while (len) {
+        int rit = write(fd, p, len);
+        if (rit < 0) {
+          if (errno == EINTR) continue;
+          throw runtime_error(strprintf("write: %s", strerror(errno)));
+        }
+        if (!rit) {
+          fprintf(stderr, "write() unexpectedly returned 0\n");
+          return;
+        }
+        p += rit;
+        len -= rit;
+      }
+    }
+  } else {
+    while (datalen) {
+      char buf[65536];
+      int zzz = min(65536, datalen);
+      int len = fread(buf, 1, zzz, f);
+      fprintf(stderr, "I want to write %i bytes; %i remain.\n", len, datalen);
+      datalen -= len;
+    }
+  }
+}
+
 void restore(FILE *f) {
   while (1) {
     char c;
+    string from = read_lenprestring(f);
     switch ((c = getc(f))) {
       case EOF: break;
-      case 'd': restore_data(f); break;
       case 0: {
         inode_metadata md = handle_special_file(c, f);
+        printf("file %s\n", from.c_str());
       } break;
       case 1:  {
         inode_metadata md = handle_special_file(c, f);
+        printf("dir %s\n", from.c_str());
       } break;
       case 2: case 3: case 4: case 6: {
         inode_metadata md = handle_special_file(c, f);
+        printf("weird-file %s\n", from.c_str());
       } break;
       case 5: { // symlink
         inode_metadata md = handle_special_file(c, f);
+        string to = read_lenprestring(f);
+        printf("symlink from %s to %s\n", from.c_str(), to.c_str());
       } break;
       case 7: { // hardlink
-        string from = read_lenprestring(f);
         string to = read_lenprestring(f);
         printf("hardlink from %s to %s\n", from.c_str(), to.c_str());
+      } break;
+      case 'd': { // data block
+        restore_data(from, f);
       } break;
       default:
         throw runtime_error(strprintf("bogus type 0x%hhx", c));
@@ -932,7 +958,7 @@ void restore(FILE *f) {
 int main(int argc, char **argv) {
   int argno = 1;
   int unpack = 0;
-  while (argv[argno][0] == '-') {
+  while (argno < argc && argv[argno][0] == '-') {
     if (!strcmp(argv[argno], "-d")) unpack = 1;
     else {
       fprintf(stderr, "unknown flag %s\n", argv[argno]);
@@ -951,6 +977,8 @@ int main(int argc, char **argv) {
     output.qempty.notify_all();
     out.join();
   } else {
-    restore(stdin);
+    try {
+      restore(stdin);
+    } catch (eof_exception &e) {}
   }
 }
