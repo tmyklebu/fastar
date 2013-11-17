@@ -282,6 +282,12 @@ struct inode_metadata {
 
   }
 
+  string tostring() {
+    const char * kinds[] = {"fil", "dir", "chr", "blk", "fifo", "lnk", "sock"};
+    return strprintf("%s %u:%u %o %lu %u %lu %lu %lu",
+        kinds[kind], uid, gid, perms, size, devno, atime, ctime, mtime);
+  }
+
   char *xattr_name(int i) {
     return &_xattr_data[xattr_name_idx[i]];
   }
