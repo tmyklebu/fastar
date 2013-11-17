@@ -38,6 +38,11 @@ serialise_md_header:
   time_t ctime
   time_t mtime
 
+hardlink:
+  char 7
+  lenprestring from
+  lenprestring to
+
 data:
   char 'd'
   lenprestring filename

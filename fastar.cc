@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 #include <memory>
 #include <set>
 #include <algorithm>
@@ -32,9 +33,6 @@
 using namespace std;
 
 #define FOR(i,n) for (int i=0;i<n;i++)
-
-template <typename T>
-unique_ptr<T> make_unique(T *t) { return unique_ptr<T>(t); }
 
 struct semaphore {
   sem_t sem;
@@ -92,6 +90,8 @@ struct ffextent {
   bool aligned, last;
   uint64_t blk, off, len;
 };
+
+string base_dir;
 
 struct file_extents {
   std::vector<ffextent> extents;
@@ -241,6 +241,13 @@ struct inode_metadata {
     }\
   }\
 } while(0)
+#define SAFE_SYSCALL0(f, p, ...) do {\
+  while(f(p, ##__VA_ARGS__) < 0) {\
+    if(errno != EINTR) {\
+      throw runtime_error(strprintf("%s: %s", #f, strerror(errno)));\
+    }\
+  }\
+} while(0)
 
   void restore(const char *path, const char *maybe_linktarget) {
     mode_t kind2S_[] = { S_IFREG, 0, S_IFCHR, S_IFBLK, S_IFIFO, 0, S_IFSOCK };
@@ -330,7 +337,7 @@ string serialise(const inode_metadata &md) {
 
 inode_metadata deserialise(const string & s) {
   const s_inode_metadata_hdr & h = *(s_inode_metadata_hdr*)&s[0];
-  char * cdr = &s[0] + sizeof(s_inode_metadata_hdr);
+  const char *cdr = &s[0] + sizeof(s_inode_metadata_hdr);
   inode_metadata md;
   md.kind = h.kind;
   md.ino = h.ino;
@@ -348,6 +355,9 @@ inode_metadata deserialise(const string & s) {
   FOR(i, 4) xattrs_siz |= cdr[0] << (8*i), cdr++;
   string xattrs(cdr, cdr+xattrs_siz);
   // TODO restore xattrs.
+}
+
+inode_metadata handle_special_file(char kind, FILE *f) {
 }
 
 static const int threads = 64;
@@ -791,14 +801,111 @@ void handle_dent(const string &name, const inode_metadata &md) {
   }
 }
 
+void restore_data(FILE *f) {
+  int fnamelen;
+#define FREAD(targ,len,nmemb) do { \
+      if (1 != fread(targ, len, nmemb, f)) \
+        throw runtime_error(strprintf("fread: %s", strerror(errno))); \
+      } while (0)
+  FREAD(&fnamelen, 4, 1);
+  string filename(fnamelen, '\0');
+  FREAD((char *)filename.data(), 1, fnamelen);
+  unsigned long long offset;
+  FREAD(&offset, 8, 1);
+  int datalen;
+  FREAD(&datalen, 8, 1);
+
+  sadface:
+  int fd = open(filename.c_str(), O_WRONLY);
+  if (fd < 0) {
+    if (errno == EINTR) goto sadface;
+    throw runtime_error(strprintf("open(%s): %s", filename.c_str(),
+        strerror(errno)));
+  }
+  fd_raii raii(fd);
+  SAFE_SYSCALL0(lseek, fd, offset, SEEK_SET);
+
+  while (datalen) {
+    char buf[33554432];
+    int zzz = min(33554432, datalen);
+    int len = fread(buf, zzz, 1, f);
+    datalen -= len;
+    char *p = buf;
+    while (len) {
+      int rit = write(fd, p, len);
+      if (rit < 0) {
+        if (errno == EINTR) continue;
+        throw runtime_error(strprintf("write: %s", strerror(errno)));
+      }
+      if (!rit) {
+        fprintf(stderr, "write() unexpectedly returned 0\n");
+        return;
+      }
+      p += rit;
+      len -= rit;
+    }
+  }
+}
+
+string read_lenprestring(FILE *f) {
+  int len;
+  FREAD(&len, 4, 1);
+  string s(len, '\0');
+  FREAD(&s[0], 1, len);
+  return s;
+}
+
+void restore(FILE *f) {
+  while (1) {
+    char c;
+    switch ((c = getc(f))) {
+      case EOF: break;
+      case 'd': restore_data(f); break;
+      case 0: {
+        inode_metadata md = handle_special_file(c, f);
+      } break;
+      case 1:  {
+        inode_metadata md = handle_special_file(c, f);
+      } break;
+      case 2: case 3: case 4: case 6: {
+        inode_metadata md = handle_special_file(c, f);
+      } break;
+      case 5: { // symlink
+        inode_metadata md = handle_special_file(c, f);
+      } break;
+      case 7: { // hardlink
+        string from = read_lenprestring(f);
+        string to = read_lenprestring(f);
+        printf("hardlink from %s to %s\n", from.c_str(), to.c_str());
+      } break;
+      default:
+        throw runtime_error(strprintf("bogus type 0x%hhx", c));
+    }
+  }
+}
+
 int main(int argc, char **argv) {
-  thread out([](){output.go();});
-  dirtree_walker w(argv[1]);
-  w.handler = handle_dent;
-  w.go();
-  grab.coalesce();
-  grab.doit();
-  output.done = 1;
-  output.qempty.notify_all();
-  out.join();
+  int argno = 1;
+  int unpack = 0;
+  while (argv[argno][0] == '-') {
+    if (!strcmp(argv[argno], "-d")) unpack = 1;
+    else {
+      fprintf(stderr, "unknown flag %s\n", argv[argno]);
+      exit(-1);
+    }
+    argno++;
+  }
+  if (!unpack) {
+    thread out([](){output.go();});
+    dirtree_walker w(argv[argno]);
+    w.handler = handle_dent;
+    w.go();
+    grab.coalesce();
+    grab.doit();
+    output.done = 1;
+    output.qempty.notify_all();
+    out.join();
+  } else {
+    restore(stdin);
+  }
 }
