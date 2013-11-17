@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <memory>
+#include <set>
+#include <algorithm>
 #include <stdarg.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -64,11 +67,17 @@ string strprintf(const char *fmt, ...) {
   return ans;
 }
 
+string length_prefix(const string &s) {
+  int sz = s.size();
+  string p((char *)&sz, (char *)(&sz+1));
+  return p+s;
+}
+
 struct ffextent {
-  ffextent(bool a, bool l, uint64_t o, uint64_t le)
-    : aligned(a), last(l), off(o), len(le) { };
+  ffextent(bool a, bool l, uint64_t o, uint64_t b, uint64_t le)
+    : aligned(a), last(l), blk(b), off(o), len(le) { };
   bool aligned, last;
-  uint64_t off, len;
+  uint64_t blk, off, len;
 };
 
 struct file_extents {
@@ -88,9 +97,12 @@ struct file_extents {
     }
 
     while(1) {
-      struct fiemap * exts = (struct fiemap *)
-        alloca(sizeof(struct fiemap) + sizeof(struct fiemap_extent) * extinfo.fm_mapped_extents);
-      memset(exts, 0, sizeof(struct fiemap));
+      size_t len = sizeof(struct fiemap)
+                 + extinfo.fm_mapped_extents * sizeof(struct fiemap_extent);
+      struct fiemap * exts = (struct fiemap *)alloca(len);
+      // XXX HACK:  Make valgrind shut up.
+      //memset(exts, 0, sizeof(struct fiemap));
+      memset(exts, 0, len);
 
       exts->fm_start = 0;
       exts->fm_length = ~0;
@@ -100,23 +112,26 @@ struct file_extents {
         if(errno != EINTR)
           throw runtime_error(strprintf("FS_IOC_FIEMAP failed: %s", strerror(errno)));
       }
-      if(!(exts->fm_extents[exts->fm_mapped_extents-1].fe_flags & FIEMAP_EXTENT_LAST))
+      if (exts->fm_mapped_extents == 0) return;
+      if(!(exts->fm_extents[exts->fm_mapped_extents-1].fe_flags
+          & FIEMAP_EXTENT_LAST))
         continue;
 
       extents.reserve(exts->fm_mapped_extents);
       for(uint32_t i = 0; i < exts->fm_mapped_extents; i++) {
         struct fiemap_extent * e = exts->fm_extents + i;
         if(e->fe_flags & (FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC
-            | FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED
-            | FIEMAP_EXTENT_UNWRITTEN))
+            | FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED))
         {
           throw runtime_error(strprintf("bogus extent: %u", e->fe_flags));
         }
-        extents.push_back(
-            ffextent(!(e->fe_flags & FIEMAP_EXTENT_NOT_ALIGNED),
-              e->fe_flags & FIEMAP_EXTENT_LAST,
-              e->fe_physical,
-              e->fe_length));
+        if (!(e->fe_flags & FIEMAP_EXTENT_UNWRITTEN))
+          extents.push_back(
+              ffextent(!(e->fe_flags & FIEMAP_EXTENT_NOT_ALIGNED),
+                e->fe_flags & FIEMAP_EXTENT_LAST,
+                e->fe_logical,
+                e->fe_physical,
+                e->fe_length));
       }
       break;
     }
@@ -168,7 +183,6 @@ struct inode_metadata {
     int last = 0;
     FOR(i, _xattr_data.size()) if (_xattr_data[i] == 0)
       xattr_name_idx.push_back(last), last = i+1;
-    //FOR(i, _xattr_data.size()) printf("%hhx ", _xattr_data[i]); printf("\n");
     if (last != _xattr_data.size())
       throw runtime_error("listxa didn't 0-terminate");
 
@@ -272,6 +286,18 @@ string serialise(const inode_metadata &md) {
 
 static const int threads = 64;
 
+struct fd_raii {
+  int fd;
+  fd_raii(int fd) : fd(fd) {}
+  ~fd_raii() { close(fd); }
+};
+
+struct dir_raii {
+  DIR *d;
+  dir_raii(DIR *d) : d(d) {}
+  ~dir_raii() { closedir(d); }
+};
+
 struct dirtree_walker {
   mutex mu;
   multimap<int, function<void()> > q;
@@ -308,13 +334,7 @@ struct dirtree_walker {
 
   function<void(const string &, const inode_metadata &)> handler;
 
-  struct dir_raii {
-    DIR *d;
-    dir_raii(DIR *d) : d(d) {}
-    ~dir_raii() { closedir(d); }
-  };
-
-  int scan_directory(string dir, ino_t myino) {
+  int scan_directory(string dir) {
     DIR *d = opendir(dir.c_str());
     if (!d) {
       fprintf(stderr, "opendir(%s): %s\n", dir.c_str(), strerror(errno));
@@ -340,7 +360,7 @@ struct dirtree_walker {
       try {
         inode_metadata md(name.c_str());
         if (md.kind == 1)
-          pushit(ino,[name,ino,this]{scan_directory(name,ino);});
+          pushit(ino,[name,this]{scan_directory(name);});
         handler(name, md);
       } catch (exception &e) {
         fprintf(stderr, "while processing %s: %s\n", name.c_str(), e.what());
@@ -352,7 +372,7 @@ struct dirtree_walker {
   }
 
   dirtree_walker(const char *dt) {
-    pushit(0, [dt,this]{scan_directory(dt,-1); return 0;});
+    pushit(0, [dt,this]{scan_directory(dt); return 0;});
     energy = 1;
   }
 
@@ -370,7 +390,7 @@ struct outputter {
   condition_variable qempty, qfull;
   queue<string> q;
   int totsiz;
-  int done;
+  atomic<int> done;
 
   outputter() {
     totsiz = 0;
@@ -390,13 +410,15 @@ struct outputter {
       string s;
       { unique_lock<mutex> lg(mu);
         while (!q.size()) {
-          qempty.wait(lg);
           if (done) return;
+          qempty.wait(lg);
         }
         s = move(q.front());
         q.pop();
         totsiz -= s.size();
       }
+      FOR(i,s.size()) if (s[i] != '\n' && s[i] < ' ' || s[i] > 'z')
+        s[i] = '?';
       dowrite(&s[0], s.size());
       qfull.notify_all();
     }
@@ -420,13 +442,180 @@ void enqueue_block(const string &s) {
   output.push(s);
 }
 
+namespace std {
+  template <typename T>
+  bool operator<(const vector<T> &, const vector<T> &) { return false; }
+}
+
+struct data_grabber {
+  mutex mu;
+  unordered_map<ino_t, string> inode_canon;
+  vector<pair<uint64_t, pair<string, vector<ffextent> > > > bigwork, smallwork;
+
+  // mashed together two concerns here; fix.  note reuse of mu.
+  struct pending_io {
+    string file;
+    uint64_t blk;
+    uint64_t off, len;
+    int last;
+    bool operator<(const pending_io &p) const { return blk < p.blk; }
+    pending_io(){}
+    pending_io(string s, ffextent e)
+      : file(s), blk(e.blk), off(e.off), len(e.len), last(e.last) {}
+  };
+
+  multiset<pending_io> pend;
+  condition_variable cv;
+  int done;
+
+  void doio(const pending_io &p) {
+    char *_buf = new char[p.len + 4096];
+    unique_ptr<char[]> argh(_buf);
+    char *buf = _buf;
+    buf += 4096 - ((intptr_t)buf & 4095);
+    sadface:
+    int fd = open(p.file.c_str(), O_RDONLY | O_DIRECT);
+    while (fd < 0) {
+      if (errno == EINTR) goto sadface;
+      throw runtime_error(strprintf("open(%s): %s",
+          p.file.c_str(), strerror(errno)));
+    }
+    fd_raii raii(fd);
+    while (lseek(fd, p.off, SEEK_SET) < 0) {
+      if (errno != EINTR) 
+        throw runtime_error(strprintf("lseek: %s", strerror(errno)));
+    }
+    if (0)
+    fprintf(stderr, "asked to read %i bytes from %s starting at %i\n",
+        (int)p.len, p.file.c_str(), (int)p.off);
+    int left = p.len;
+    char *fub = buf;
+    while (left) {
+      int red = read(fd, fub, left);
+      if (red < 0) {
+        if (errno == EINTR) continue;
+        throw runtime_error(strprintf("read(%s): %s",
+            p.file.c_str(), strerror(errno)));
+      }
+      if (red == 0) {
+        if (!p.last)
+          fprintf(stderr, "unexpected eof reading %s", p.file.c_str());
+        break;
+      }
+      fub += red;
+      left -= red;
+    }
+
+    string ans;
+    ans += 'd';
+    ans += length_prefix(string(buf, buf+(fub-buf)));
+    enqueue_block(ans);
+  }
+
+  void consumer() {
+    uint64_t last_blk = rand();
+    while (1) {
+      pending_io p;
+      p.blk = last_blk;
+      { unique_lock<mutex> lg(mu);
+        while (!pend.size()) {
+          if (done) return;
+          cv.wait(lg);
+        }
+        auto it = pend.lower_bound(p);
+        if (it == pend.end()) it = pend.begin();
+        p = *it;
+        pend.erase(it);
+      }
+      last_blk = p.blk;
+      doio(p);
+    }
+  }
+
+  void doit() {
+    static const int grab_nthread = 16;
+    vector<thread> vt;
+    FOR(i, grab_nthread) vt.push_back(thread([this](){consumer();}));
+    FOR(i, bigwork.size())
+      FOR(j, bigwork[i].second.second.size()) {
+        unique_lock<mutex> lg(mu);
+        const string &foo = bigwork[i].second.first;
+        pend.insert(pending_io(foo, bigwork[i].second.second[j]));
+        cv.notify_all();
+      }
+    sort(smallwork.begin(), smallwork.end());
+    FOR(i, smallwork.size())
+      FOR(j, smallwork[i].second.second.size()) {
+        unique_lock<mutex> lg(mu);
+        const string &foo = smallwork[i].second.first;
+        pend.insert(pending_io(foo, smallwork[i].second.second[j]));
+        cv.notify_all();
+      }
+    done = 1;
+    cv.notify_all();
+    FOR(i, vt.size()) vt[i].join();
+  }
+
+  void coalesce() {
+    // TODO
+  }
+
+  void add(const string &name, const inode_metadata &md) {
+    { lock_guard<mutex> lg(mu);
+      if (inode_canon.count(md.ino)) {
+        // hard links
+        string block = "\007";
+        block += length_prefix(name) + length_prefix(inode_canon[md.ino]);
+        enqueue_block(block);
+        return;
+      }
+      inode_canon[md.ino] = name;
+    }
+
+    sadface:
+    int fd = open(name.c_str(), O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+      if (errno == EINTR) goto sadface;
+      if (errno == EACCES) {
+        fprintf(stderr, "warning: open(%s): %s\n", name.c_str(),
+            strerror(errno));
+        return;
+      }
+      throw runtime_error(strprintf("open(%s): %s", name.c_str(),
+          strerror(errno)));
+    }
+    fd_raii raii(fd);
+    try {
+      file_extents ext(fd);
+      size_t totlen = 0;
+      FOR(i, ext.extents.size()) totlen += ext.extents[i].len;
+      if (totlen == 0) {
+        return;
+      }
+      if (totlen > (32<<20)) {
+        lock_guard<mutex> lg(mu);
+        bigwork.push_back(make_pair(ext.extents[0].blk,
+            make_pair(name, ext.extents)));
+      } else {
+        lock_guard<mutex> lg(mu);
+        smallwork.push_back(make_pair(ext.extents[0].blk,
+            make_pair(name, ext.extents)));
+      }
+    } catch (exception &e) {
+      fprintf(stderr, "warning: failed to fetch extents for %s: %s\n",
+           name.c_str(), e.what());
+    }
+  }
+} grab;
+
 void handle_dent(const string &name, const inode_metadata &md) {
+  string prefix = length_prefix(name);
   switch (md.kind) {
     case 1: case 2: case 3: case 4: case 6: {
-      enqueue_block(serialise(md));
+      enqueue_block(prefix + serialise(md));
     } break;
     case 5: {
-      string foo = serialise(md);
+      string foo = prefix + serialise(md);
       char buf[8192];
       while (1) {
         int len = readlink(name.c_str(), buf, 8192);
@@ -443,17 +632,21 @@ void handle_dent(const string &name, const inode_metadata &md) {
       enqueue_block(foo);
     } break;
     case 0: {
-      enqueue_block(serialise(md));
+      enqueue_block(prefix + serialise(md));
+      grab.add(name, md);
     } break;
     default: throw runtime_error(strprintf("weird kind %i", md.kind));
   }
 }
 
 int main(int argc, char **argv) {
+  //freopen("/dev/null", "w", stdout);
   thread out([](){output.go();});
   dirtree_walker w(argv[1]);
   w.handler = handle_dent;
   w.go();
+  grab.coalesce();
+  grab.doit();
   output.done = 1;
   output.qempty.notify_all();
   out.join();
