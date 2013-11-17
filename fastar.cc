@@ -263,7 +263,7 @@ struct inode_metadata {
         SAFE_SYSCALL(mkdir, path, 0);
         break;
       case 5:
-        SAFE_SYSCALL(symlink, path, maybe_linktarget);
+        SAFE_SYSCALL(symlink, maybe_linktarget, path);
         break;
       default:
         throw runtime_error("weird kind");
@@ -934,12 +934,29 @@ void restore_data(string filename, FILE *f) {
   }
 }
 
+vector<pair<string, utimbuf> > time_fixup_list;
+
+void fixup_times() {
+  FOR(i, time_fixup_list.size())
+    if (utime(time_fixup_list[i].first.c_str(), &time_fixup_list[i].second) < 0)
+      fprintf(stderr, "warning: couldn't fixup times for %s: %s\n",
+          time_fixup_list[i].first.c_str(), strerror(errno));
+}
+
 void restore(FILE *f) {
   while (1) {
     int c;
     string from = read_lenprestring(f);
     switch ((c = getc(f))) {
-      case 0: case 1: case 2: case 3: case 4: case 6: {
+      case 0: case 1: {
+        inode_metadata md = handle_special_file(c, f);
+        md.restore(from.c_str(), 0);
+        utimbuf tb;
+        tb.actime = md.atime;
+        tb.modtime = md.mtime;
+        time_fixup_list.push_back(make_pair(from, tb));
+      } break;
+      case 2: case 3: case 4: case 6: {
         inode_metadata md = handle_special_file(c, f);
         md.restore(from.c_str(), 0);
       } break;
@@ -986,5 +1003,6 @@ int main(int argc, char **argv) {
     try {
       restore(stdin);
     } catch (eof_exception &e) {}
+    fixup_times();
   }
 }
