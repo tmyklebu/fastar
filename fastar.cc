@@ -71,7 +71,11 @@ string strprintf(const char *fmt, ...) {
   return ans;
 }
 
-string length_prefix(const string &s) {
+string int2string(int sz) {
+  string p((char *)&sz, (char *)(&sz+1));
+  return p;
+}
+string length_prefixed(const string &s) {
   int sz = s.size();
   string p((char *)&sz, (char *)(&sz+1));
   return p+s;
@@ -413,6 +417,29 @@ struct pending_iovec_output : pending_output {
   vector<iovec> get_iovec() { return v; }
 };
 
+struct pending_datapkt_output : pending_output {
+  string hdr;
+  char *data;
+  int off;
+  size_t datalen;
+  
+  pending_datapkt_output(const string &hdr, char *payload, int off, size_t len)
+    : hdr(hdr), data(payload), off(off), datalen(len) {}
+
+  ~pending_datapkt_output() {
+    delete[] data;
+  }
+
+  vector<iovec> get_iovec() {
+    vector<iovec> iov(2);
+    iov[0].iov_base = &hdr[0];
+    iov[0].iov_len = hdr.size();
+    iov[1].iov_base = data + off;
+    iov[1].iov_len = datalen;
+    return iov;
+  }
+};
+
 struct outputter {
   mutex mu;
   condition_variable qempty, qfull;
@@ -425,19 +452,11 @@ struct outputter {
     done = 0;
   }
 
-  void push(const string &s) {
+  void push(unique_ptr<pending_output> po, size_t siz) {
     unique_lock<mutex> lg(mu);
     while (totsiz > (64<<20)) qfull.wait(lg);
-    q.push(unique_ptr<pending_output>(new pending_string_output(s)));
-    totsiz += s.size();
-    qempty.notify_all();
-  }
-
-  void push(const vector<iovec> &iov) {
-    unique_lock<mutex> lg(mu);
-    while (totsiz > (64<<20)) qfull.wait(lg);
-    q.push(unique_ptr<pending_output>(new pending_iovec_output(iov)));
-    FOR(i, iov.size()) totsiz += iov[i].iov_len;
+    q.push(move(po));
+    totsiz += siz;
     qempty.notify_all();
   }
 
@@ -480,11 +499,20 @@ struct outputter {
 } output;
 
 void enqueue_block(const string &s) {
-  output.push(s);
+  output.push(unique_ptr<pending_output>(
+      new pending_string_output(s)), s.size());
 }
 
 void enqueue_iovec(const vector<iovec> &v) {
-  output.push(v);
+  size_t sz = 0;
+  FOR(i, v.size()) sz += v[i].iov_len;
+  output.push(unique_ptr<pending_output>(
+      new pending_iovec_output(v)), sz);
+}
+
+void enqueue_datapkt(const string &h, char *p, int off, size_t len) {
+  output.push(unique_ptr<pending_output>(
+      new pending_datapkt_output(h, p, off, len)), h.size() + len);
 }
 
 namespace std {
@@ -551,10 +579,13 @@ struct data_grabber {
       left -= red;
     }
 
-    string ans;
-    ans += 'd';
-    ans += length_prefix(string(buf, buf+(fub-buf)));
-    enqueue_block(ans);
+    argh.release();
+    string hdr;
+    hdr = "d";
+    hdr += length_prefixed(p.file);
+    hdr += int2string(p.off);
+    hdr += int2string(fub-buf);
+    enqueue_datapkt(hdr, _buf, buf-_buf, fub-buf);
   }
 
   void consumer() {
@@ -610,7 +641,7 @@ struct data_grabber {
       if (inode_canon.count(md.ino)) {
         // hard links
         string block = "\007";
-        block += length_prefix(name) + length_prefix(inode_canon[md.ino]);
+        block += length_prefixed(name) + length_prefixed(inode_canon[md.ino]);
         enqueue_block(block);
         return;
       }
@@ -654,7 +685,7 @@ struct data_grabber {
 } grab;
 
 void handle_dent(const string &name, const inode_metadata &md) {
-  string prefix = length_prefix(name);
+  string prefix = length_prefixed(name);
   switch (md.kind) {
     case 1: case 2: case 3: case 4: case 6: {
       enqueue_block(prefix + serialise(md));
