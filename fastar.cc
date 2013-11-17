@@ -371,6 +371,29 @@ inode_metadata deserialise(const string & s) {
   md._xattr_data.assign(cdr, cdr+xattrs_siz);
 }
 
+inode_metadata handle_special_file(char kind, FILE * f) {
+  char bfr1[sizeof(s_inode_metadata_hdr) + 6];
+  char * p = bfr1;
+  FREAD(p, sizeof(s_inode_metadata_hdr), 1);
+  p += sizeof(s_inode_metadata_hdr);
+  if(kind == 2 || kind == 3) {
+    FREAD(p, 1, 2);
+    p += 2;
+  }
+  FREAD(p, 1, 4);
+
+  int xattrs_siz = 0;
+  FOR(i, 4) xattrs_siz |= p[0] << (8*i), p++;
+
+  char * bfr2 = (char*)alloca(xattrs_siz);
+  FREAD(bfr2, 1, xattrs_siz);
+
+  string allbfr = string(bfr1, p) + string(bfr2, bfr2+xattrs_siz);
+  return deserialise(allbfr);
+}
+
+
+
 static const int threads = 64;
 
 struct fd_raii {
