@@ -72,7 +72,11 @@ string strprintf(const char *fmt, ...) {
   return ans;
 }
 
-string length_prefix(const string &s) {
+string int2string(int sz) {
+  string p((char *)&sz, (char *)(&sz+1));
+  return p;
+}
+string length_prefixed(const string &s) {
   int sz = s.size();
   string p((char *)&sz, (char *)(&sz+1));
   return p+s;
@@ -467,6 +471,29 @@ struct pending_iovec_output : pending_output {
   vector<iovec> get_iovec() { return v; }
 };
 
+struct pending_datapkt_output : pending_output {
+  string hdr;
+  char *data;
+  int off;
+  size_t datalen;
+  
+  pending_datapkt_output(const string &hdr, char *payload, int off, size_t len)
+    : hdr(hdr), data(payload), off(off), datalen(len) {}
+
+  ~pending_datapkt_output() {
+    delete[] data;
+  }
+
+  vector<iovec> get_iovec() {
+    vector<iovec> iov(2);
+    iov[0].iov_base = &hdr[0];
+    iov[0].iov_len = hdr.size();
+    iov[1].iov_base = data + off;
+    iov[1].iov_len = datalen;
+    return iov;
+  }
+};
+
 struct outputter {
   mutex mu;
   condition_variable qempty, qfull;
@@ -479,19 +506,11 @@ struct outputter {
     done = 0;
   }
 
-  void push(const string &s) {
+  void push(unique_ptr<pending_output> po, size_t siz) {
     unique_lock<mutex> lg(mu);
     while (totsiz > (64<<20)) qfull.wait(lg);
-    q.push(unique_ptr<pending_output>(new pending_string_output(s)));
-    totsiz += s.size();
-    qempty.notify_all();
-  }
-
-  void push(const vector<iovec> &iov) {
-    unique_lock<mutex> lg(mu);
-    while (totsiz > (64<<20)) qfull.wait(lg);
-    q.push(unique_ptr<pending_output>(new pending_iovec_output(iov)));
-    FOR(i, iov.size()) totsiz += iov[i].iov_len;
+    q.push(move(po));
+    totsiz += siz;
     qempty.notify_all();
   }
 
@@ -521,10 +540,17 @@ struct outputter {
       ssize_t len = writev(1, vec, vecs);
       if (len < 0) {
         if (errno == EINTR) continue;
+        fprintf(stderr, "writev failed.  iovec was %i long:\n", vecs);
+        FOR(i, vecs)
+          fprintf(stderr, "%llx %lli\n", vec[i].iov_base, vec[i].iov_len);
         throw runtime_error(strprintf("outputter couldn't output: %s",
             strerror(errno)));
       }
-      while (len >= vec[0].iov_len) vecs--, len -= vec[0].iov_len, vec++;
+      while (vecs && len >= vec[0].iov_len) {
+        len -= vec[0].iov_len;
+        vecs--;
+        vec++;
+      }
       if (len) {
         vec[0].iov_len -= len;
         vec[0].iov_base = (char *)vec[0].iov_base + len;
@@ -534,11 +560,20 @@ struct outputter {
 } output;
 
 void enqueue_block(const string &s) {
-  output.push(s);
+  output.push(unique_ptr<pending_output>(
+      new pending_string_output(s)), s.size());
 }
 
 void enqueue_iovec(const vector<iovec> &v) {
-  output.push(v);
+  size_t sz = 0;
+  FOR(i, v.size()) sz += v[i].iov_len;
+  output.push(unique_ptr<pending_output>(
+      new pending_iovec_output(v)), sz);
+}
+
+void enqueue_datapkt(const string &h, char *p, int off, size_t len) {
+  output.push(unique_ptr<pending_output>(
+      new pending_datapkt_output(h, p, off, len)), h.size() + len);
 }
 
 namespace std {
@@ -563,8 +598,8 @@ struct data_grabber {
       : file(s), blk(e.blk), off(e.off), len(e.len), last(e.last) {}
   };
 
-  multiset<pending_io> pend;
-  condition_variable cv;
+  multiset<pending_io> bigpend, smallpend;
+  condition_variable bigcv, smallcv;
   int done;
 
   void doio(const pending_io &p) {
@@ -605,13 +640,16 @@ struct data_grabber {
       left -= red;
     }
 
-    string ans;
-    ans += 'd';
-    ans += length_prefix(string(buf, buf+(fub-buf)));
-    enqueue_block(ans);
+    argh.release();
+    string hdr;
+    hdr = "d";
+    hdr += length_prefixed(p.file);
+    hdr += int2string(p.off);
+    hdr += int2string(fub-buf);
+    enqueue_datapkt(hdr, _buf, buf-_buf, fub-buf);
   }
 
-  void consumer() {
+  void consumer(multiset<pending_io> &pend, condition_variable &cv) {
     uint64_t last_blk = rand();
     while (1) {
       pending_io p;
@@ -624,34 +662,45 @@ struct data_grabber {
         auto it = pend.lower_bound(p);
         if (it == pend.end()) it = pend.begin();
         p = *it;
+        last_blk = p.blk;
         pend.erase(it);
       }
-      last_blk = p.blk;
       doio(p);
     }
   }
 
   void doit() {
     static const int grab_nthread = 16;
+    static const int small_grab_nthread = 64;
     vector<thread> vt;
-    FOR(i, grab_nthread) vt.push_back(thread([this](){consumer();}));
+    FOR(i, grab_nthread)
+      vt.push_back(thread([this](){consumer(bigpend, bigcv);}));
+    FOR(i, small_grab_nthread)
+      vt.push_back(thread([this](){consumer(smallpend, smallcv);}));
     FOR(i, bigwork.size())
       FOR(j, bigwork[i].second.second.size()) {
         unique_lock<mutex> lg(mu);
         const string &foo = bigwork[i].second.first;
-        pend.insert(pending_io(foo, bigwork[i].second.second[j]));
-        cv.notify_all();
+        bigpend.insert(pending_io(foo, bigwork[i].second.second[j]));
+        bigcv.notify_one();
       }
     sort(smallwork.begin(), smallwork.end());
     FOR(i, smallwork.size())
       FOR(j, smallwork[i].second.second.size()) {
         unique_lock<mutex> lg(mu);
         const string &foo = smallwork[i].second.first;
-        pend.insert(pending_io(foo, smallwork[i].second.second[j]));
-        cv.notify_all();
+        ffextent &e = smallwork[i].second.second[j];
+        if (e.len > 65536) {
+          bigpend.insert(pending_io(foo, e));
+          bigcv.notify_one();
+        } else {
+          smallpend.insert(pending_io(foo, e));
+          smallcv.notify_one();
+        }
       }
     done = 1;
-    cv.notify_all();
+    bigcv.notify_all();
+    smallcv.notify_all();
     FOR(i, vt.size()) vt[i].join();
   }
 
@@ -664,7 +713,7 @@ struct data_grabber {
       if (inode_canon.count(md.ino)) {
         // hard links
         string block = "\007";
-        block += length_prefix(name) + length_prefix(inode_canon[md.ino]);
+        block += length_prefixed(name) + length_prefixed(inode_canon[md.ino]);
         enqueue_block(block);
         return;
       }
@@ -708,7 +757,7 @@ struct data_grabber {
 } grab;
 
 void handle_dent(const string &name, const inode_metadata &md) {
-  string prefix = length_prefix(name);
+  string prefix = length_prefixed(name);
   switch (md.kind) {
     case 1: case 2: case 3: case 4: case 6: {
       enqueue_block(prefix + serialise(md));
@@ -739,7 +788,6 @@ void handle_dent(const string &name, const inode_metadata &md) {
 }
 
 int main(int argc, char **argv) {
-  //freopen("/dev/null", "w", stdout);
   thread out([](){output.go();});
   dirtree_walker w(argv[1]);
   w.handler = handle_dent;
