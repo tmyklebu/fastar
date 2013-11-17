@@ -325,7 +325,7 @@ string serialise(const inode_metadata &md) {
   return ans;
 }
 
-inode_metadata deserialise(const string & s) {
+inode_metadata deserialise(const string &s, const string &xattrs) {
   const s_inode_metadata_hdr &h = *(s_inode_metadata_hdr*)&s[0];
   const char *cdr = &s[0] + sizeof(s_inode_metadata_hdr);
   inode_metadata md;
@@ -342,12 +342,14 @@ inode_metadata deserialise(const string & s) {
     md.devno = cdr[1] << 8 | cdr[0];
     cdr += 2;
   }
-  int xattrs_siz = string2int(string(cdr, cdr+4));
-  cdr += 4;
+
+  md._xattr_data.resize(xattrs.size());
+  memcpy(&md._xattr_data[0], &xattrs[0], xattrs.size());
+  
   int start = 0;
   bool iskey = true;
-  FOR(i, xattrs_siz) {
-    if(cdr[i] == '\0') {
+  FOR(i, md._xattr_data.size()) {
+    if(md._xattr_data[i] == '\0') {
       if(iskey) {
         md.xattr_name_idx.push_back(start);
       } else {
@@ -356,12 +358,6 @@ inode_metadata deserialise(const string & s) {
       start = i+1;
       iskey = ~iskey;
     }
-  }
-  if (xattrs_siz) {
-    fprintf(stderr, "%p %p\n", &s[0], &md._xattr_data[0]);
-    exit(0);
-    md._xattr_data.resize(xattrs_siz);
-    memcpy(&md._xattr_data[0], cdr, xattrs_siz);
   }
   return md;
 }
@@ -847,10 +843,10 @@ inode_metadata get_inode_md(char kind, FILE * f) {
     p += 2;
   }
 
-  string lps = read_lenprestring(f);
-  string allbfr = string(bfr1, p) + int2string(lps.size()) + lps;
+  string xattrs = read_lenprestring(f);
+  string allbfr = string(bfr1, p);
 
-  return deserialise(allbfr);
+  return deserialise(allbfr, xattrs);
 }
 
 bool dry_run = false;
