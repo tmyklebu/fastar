@@ -486,10 +486,17 @@ struct outputter {
       ssize_t len = writev(1, vec, vecs);
       if (len < 0) {
         if (errno == EINTR) continue;
+        fprintf(stderr, "writev failed.  iovec was %i long:\n", vecs);
+        FOR(i, vecs)
+          fprintf(stderr, "%llx %lli\n", vec[i].iov_base, vec[i].iov_len);
         throw runtime_error(strprintf("outputter couldn't output: %s",
             strerror(errno)));
       }
-      while (len >= vec[0].iov_len) vecs--, len -= vec[0].iov_len, vec++;
+      while (vecs && len >= vec[0].iov_len) {
+        len -= vec[0].iov_len;
+        vecs--;
+        vec++;
+      }
       if (len) {
         vec[0].iov_len -= len;
         vec[0].iov_base = (char *)vec[0].iov_base + len;
@@ -537,8 +544,8 @@ struct data_grabber {
       : file(s), blk(e.blk), off(e.off), len(e.len), last(e.last) {}
   };
 
-  multiset<pending_io> pend;
-  condition_variable cv;
+  multiset<pending_io> bigpend, smallpend;
+  condition_variable bigcv, smallcv;
   int done;
 
   void doio(const pending_io &p) {
@@ -588,7 +595,7 @@ struct data_grabber {
     enqueue_datapkt(hdr, _buf, buf-_buf, fub-buf);
   }
 
-  void consumer() {
+  void consumer(multiset<pending_io> &pend, condition_variable &cv) {
     uint64_t last_blk = rand();
     while (1) {
       pending_io p;
@@ -601,34 +608,45 @@ struct data_grabber {
         auto it = pend.lower_bound(p);
         if (it == pend.end()) it = pend.begin();
         p = *it;
+        last_blk = p.blk;
         pend.erase(it);
       }
-      last_blk = p.blk;
       doio(p);
     }
   }
 
   void doit() {
     static const int grab_nthread = 16;
+    static const int small_grab_nthread = 64;
     vector<thread> vt;
-    FOR(i, grab_nthread) vt.push_back(thread([this](){consumer();}));
+    FOR(i, grab_nthread)
+      vt.push_back(thread([this](){consumer(bigpend, bigcv);}));
+    FOR(i, small_grab_nthread)
+      vt.push_back(thread([this](){consumer(smallpend, smallcv);}));
     FOR(i, bigwork.size())
       FOR(j, bigwork[i].second.second.size()) {
         unique_lock<mutex> lg(mu);
         const string &foo = bigwork[i].second.first;
-        pend.insert(pending_io(foo, bigwork[i].second.second[j]));
-        cv.notify_all();
+        bigpend.insert(pending_io(foo, bigwork[i].second.second[j]));
+        bigcv.notify_one();
       }
     sort(smallwork.begin(), smallwork.end());
     FOR(i, smallwork.size())
       FOR(j, smallwork[i].second.second.size()) {
         unique_lock<mutex> lg(mu);
         const string &foo = smallwork[i].second.first;
-        pend.insert(pending_io(foo, smallwork[i].second.second[j]));
-        cv.notify_all();
+        ffextent &e = smallwork[i].second.second[j];
+        if (e.len > 65536) {
+          bigpend.insert(pending_io(foo, e));
+          bigcv.notify_one();
+        } else {
+          smallpend.insert(pending_io(foo, e));
+          smallcv.notify_one();
+        }
       }
     done = 1;
-    cv.notify_all();
+    bigcv.notify_all();
+    smallcv.notify_all();
     FOR(i, vt.size()) vt[i].join();
   }
 
