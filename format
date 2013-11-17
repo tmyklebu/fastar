@@ -1,0 +1,42 @@
+Wire format:
+  md_records
+  data
+
+md_records: md_record ...
+
+md_record:
+  int name_sz
+  char name[name_sz]
+  serialised_md
+  // if serialise_md is of type symlink:
+    u32 link_target_len
+    char link_target[link_target_len]
+
+serialise_md:
+  serialise_md_header
+  // if serialise_md is of type dev:
+    u16 devno
+  u32 xattrs_len
+  char xattrs[xattrs_len] // as 'key1\0val1\0'...
+
+serialise_md_header:
+  char kind
+  /*  kind values:
+        0   S_ISREG
+        1   S_ISDIR
+        2   S_ISCHR
+        3   S_ISBLK
+        4   S_ISFIFO
+        5   S_ISLNK
+        6   S_ISSOCK
+   */
+  ino_t ino
+  int uid
+  int gid
+  u16 perms
+  time_t atime
+  time_t ctime
+  time_t mtime
+
+data:
+
