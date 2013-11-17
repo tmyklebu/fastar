@@ -24,7 +24,6 @@
 #include <condition_variable>
 #include <atomic>
 #include <queue>
-#include <semaphore.h>
 #include <linux/fs.h>
 #include <linux/fiemap.h>
 #include <sys/ioctl.h>
@@ -33,31 +32,6 @@
 using namespace std;
 
 #define FOR(i,n) for (int i=0;i<n;i++)
-
-struct semaphore {
-  sem_t sem;
-  semaphore() { sem_init(&sem, 0, 0); }
-
-  void wait() {
-    while (1) {
-      int st = sem_wait(&sem);
-      if (st && errno == EINTR) continue;
-      else if (st) {
-        perror("sem_wait");
-        abort();
-      } else break;
-    }
-  }
-
-  void post() {
-    top:;
-    int st = sem_post(&sem);
-    if (st && errno == EOVERFLOW) { usleep(1000); goto top; }
-    if (st) { perror("sem_post"); abort(); }
-  }
-
-  int get() { int k; sem_getvalue(&sem, &k); return k; }
-};
 
 string strprintf(const char *fmt, ...) {
   va_list vargs;
@@ -406,38 +380,38 @@ struct dir_raii {
   ~dir_raii() { closedir(d); }
 };
 
+// TODO:  If the fs supports it, use FIEMAP or FIBMAP to figure out the extents
+// of a directory.  Use the first extent instead of the inode number.
 struct dirtree_walker {
   mutex mu;
   multimap<int, function<void()> > q;
-  semaphore qsize;
-  atomic<int> energy;
+  condition_variable cv;
+  int done;
 
   void pushit(int key, function<void()> f) {
     lock_guard<mutex> g(mu);
     q.insert(make_pair(key, f));
-    qsize.post();
-    ++energy;
+    cv.notify_one();
   }
 
   void processing_thread() {
     int lastino = 0;
-    while (energy != 0) {
-      qsize.wait();
+    while (1) {
       function<void()> f;
       {
-        lock_guard<mutex> g(mu);
+        unique_lock<mutex> lg(mu);
+        while (!q.size()) {
+          if (done) return;
+          cv.wait(lg);
+        }
         auto it = q.lower_bound(lastino);
         if (it == q.end()) it = q.begin();
-        if (it == q.end()) { fprintf(stderr, "underfull queue\n"); break; }
         lastino = it->first;
         f = it->second;
         q.erase(it);
       }
       f();
-      --energy;
     }
-
-    pushit(0, [](){return 0;});
   }
 
   function<void(const string &, const inode_metadata &)> handler;
@@ -480,14 +454,16 @@ struct dirtree_walker {
   }
 
   dirtree_walker(const char *dt) {
+    done = 0;
     pushit(0, [dt,this]{scan_directory(dt); return 0;});
-    energy = 1;
   }
 
   void go() {
     vector<thread> vt;
     for (int i = 0; i < threads; i++)
       vt.push_back(thread([this](){processing_thread();}));
+    done = 1;
+    cv.notify_all();
     for (int i = 0; i < threads; i++)
       vt[i].join();
   }
