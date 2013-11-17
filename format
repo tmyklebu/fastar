@@ -39,4 +39,7 @@ serialise_md_header:
   time_t mtime
 
 data:
-
+  char 'd'
+  lenprestring filename
+  int64 off
+  lenprestring data

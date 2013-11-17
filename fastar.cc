@@ -76,6 +76,10 @@ string int2string(int sz) {
   string p((char *)&sz, (char *)(&sz+1));
   return p;
 }
+string ll2string(long long sz) {
+  string p((char *)&sz, (char *)(&sz+1));
+  return p;
+}
 string length_prefixed(const string &s) {
   int sz = s.size();
   string p((char *)&sz, (char *)(&sz+1));
@@ -644,7 +648,7 @@ struct data_grabber {
     string hdr;
     hdr = "d";
     hdr += length_prefixed(p.file);
-    hdr += int2string(p.off);
+    hdr += ll2string(p.off);
     hdr += int2string(fub-buf);
     enqueue_datapkt(hdr, _buf, buf-_buf, fub-buf);
   }
