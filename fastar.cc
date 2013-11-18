@@ -24,7 +24,6 @@
 #include <condition_variable>
 #include <atomic>
 #include <queue>
-#include <semaphore.h>
 #include <linux/fs.h>
 #include <linux/fiemap.h>
 #include <sys/ioctl.h>
@@ -33,31 +32,6 @@
 using namespace std;
 
 #define FOR(i,n) for (int i=0;i<n;i++)
-
-struct semaphore {
-  sem_t sem;
-  semaphore() { sem_init(&sem, 0, 0); }
-
-  void wait() {
-    while (1) {
-      int st = sem_wait(&sem);
-      if (st && errno == EINTR) continue;
-      else if (st) {
-        perror("sem_wait");
-        abort();
-      } else break;
-    }
-  }
-
-  void post() {
-    top:;
-    int st = sem_post(&sem);
-    if (st && errno == EOVERFLOW) { usleep(1000); goto top; }
-    if (st) { perror("sem_post"); abort(); }
-  }
-
-  int get() { int k; sem_getvalue(&sem, &k); return k; }
-};
 
 string strprintf(const char *fmt, ...) {
   va_list vargs;
@@ -357,7 +331,7 @@ string serialise(const inode_metadata &md) {
   return ans;
 }
 
-inode_metadata deserialise(const string & s) {
+inode_metadata deserialise(const string &s, const string &xattrs) {
   const s_inode_metadata_hdr &h = *(s_inode_metadata_hdr*)&s[0];
   const char *cdr = &s[0] + sizeof(s_inode_metadata_hdr);
   inode_metadata md;
@@ -374,12 +348,14 @@ inode_metadata deserialise(const string & s) {
     md.devno = cdr[1] << 8 | cdr[0];
     cdr += 2;
   }
-  int xattrs_siz = string2int(string(cdr, cdr+4));
-  cdr += 4;
+
+  md._xattr_data.resize(xattrs.size());
+  memcpy(&md._xattr_data[0], &xattrs[0], xattrs.size());
+  
   int start = 0;
   bool iskey = true;
-  FOR(i, xattrs_siz) {
-    if(cdr[i] == '\0') {
+  FOR(i, md._xattr_data.size()) {
+    if(md._xattr_data[i] == '\0') {
       if(iskey) {
         md.xattr_name_idx.push_back(start);
       } else {
@@ -388,12 +364,6 @@ inode_metadata deserialise(const string & s) {
       start = i+1;
       iskey = ~iskey;
     }
-  }
-  if (xattrs_siz) {
-    fprintf(stderr, "%p %p\n", &s[0], &md._xattr_data[0]);
-    exit(0);
-    md._xattr_data.resize(xattrs_siz);
-    memcpy(&md._xattr_data[0], cdr, xattrs_siz);
   }
   return md;
 }
@@ -412,38 +382,38 @@ struct dir_raii {
   ~dir_raii() { closedir(d); }
 };
 
+// TODO:  If the fs supports it, use FIEMAP or FIBMAP to figure out the extents
+// of a directory.  Use the first extent instead of the inode number.
 struct dirtree_walker {
   mutex mu;
   multimap<int, function<void()> > q;
-  semaphore qsize;
-  atomic<int> energy;
+  condition_variable cv;
+  int done;
 
   void pushit(int key, function<void()> f) {
     lock_guard<mutex> g(mu);
     q.insert(make_pair(key, f));
-    qsize.post();
-    ++energy;
+    cv.notify_one();
   }
 
   void processing_thread() {
     int lastino = 0;
-    while (energy != 0) {
-      qsize.wait();
+    while (1) {
       function<void()> f;
       {
-        lock_guard<mutex> g(mu);
+        unique_lock<mutex> lg(mu);
+        while (!q.size()) {
+          if (done) return;
+          cv.wait(lg);
+        }
         auto it = q.lower_bound(lastino);
         if (it == q.end()) it = q.begin();
-        if (it == q.end()) { fprintf(stderr, "underfull queue\n"); break; }
         lastino = it->first;
         f = it->second;
         q.erase(it);
       }
       f();
-      --energy;
     }
-
-    pushit(0, [](){return 0;});
   }
 
   function<void(const string &, const inode_metadata &)> handler;
@@ -486,14 +456,16 @@ struct dirtree_walker {
   }
 
   dirtree_walker(const char *dt) {
+    done = 0;
     pushit(0, [dt,this]{scan_directory(dt); return 0;});
-    energy = 1;
   }
 
   void go() {
     vector<thread> vt;
     for (int i = 0; i < threads; i++)
       vt.push_back(thread([this](){processing_thread();}));
+    done = 1;
+    cv.notify_all();
     for (int i = 0; i < threads; i++)
       vt[i].join();
   }
@@ -866,7 +838,7 @@ string read_lenprestring(FILE *f) {
   return s;
 }
 
-inode_metadata handle_special_file(char kind, FILE * f) {
+inode_metadata get_inode_md(char kind, FILE * f) {
   ungetc(kind, f);
   char bfr1[sizeof(s_inode_metadata_hdr) + 6];
   char * p = bfr1;
@@ -877,10 +849,10 @@ inode_metadata handle_special_file(char kind, FILE * f) {
     p += 2;
   }
 
-  string lps = read_lenprestring(f);
-  string allbfr = string(bfr1, p) + int2string(lps.size()) + lps;
+  string xattrs = read_lenprestring(f);
+  string allbfr = string(bfr1, p);
 
-  return deserialise(allbfr);
+  return deserialise(allbfr, xattrs);
 }
 
 bool dry_run = false;
@@ -906,7 +878,13 @@ void restore_data(string filename, FILE *f) {
       char buf[65536];
       int zzz = min(65536, datalen);
       int len = fread(buf, 1, zzz, f);
-      // TODO: error check.
+      if (len != zzz) {
+        if (feof(f)) 
+          throw runtime_error("fread came up short during data block "
+              "read: unexpected eof");
+        throw runtime_error(strprintf("fread came up short during data block "
+            "read: %s", strerror(errno)));
+      }
       datalen -= len;
       char *p = buf;
       while (len) {
@@ -949,7 +927,7 @@ void restore(FILE *f) {
     string from = read_lenprestring(f);
     switch ((c = getc(f))) {
       case 0: case 1: {
-        inode_metadata md = handle_special_file(c, f);
+        inode_metadata md = get_inode_md(c, f);
         md.restore(from.c_str(), 0);
         utimbuf tb;
         tb.actime = md.atime;
@@ -957,11 +935,11 @@ void restore(FILE *f) {
         time_fixup_list.push_back(make_pair(from, tb));
       } break;
       case 2: case 3: case 4: case 6: {
-        inode_metadata md = handle_special_file(c, f);
+        inode_metadata md = get_inode_md(c, f);
         md.restore(from.c_str(), 0);
       } break;
       case 5: {
-        inode_metadata md = handle_special_file(c, f);
+        inode_metadata md = get_inode_md(c, f);
         string to = read_lenprestring(f);
         md.restore(from.c_str(), to.c_str());
       } break;
