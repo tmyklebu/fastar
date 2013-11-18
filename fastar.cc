@@ -70,10 +70,61 @@ struct ffextent {
 
 string base_dir;
 
+struct fd_raii {
+  int fd;
+  fd_raii(int fd) : fd(fd) {}
+  ~fd_raii() { close(fd); }
+};
+
+struct dir_raii {
+  DIR *d;
+  dir_raii(DIR *d) : d(d) {}
+  ~dir_raii() { closedir(d); }
+};
+
 struct file_extents {
   std::vector<ffextent> extents;
 
   file_extents(int fd) {
+    grab_extents_fiemap(fd);
+  }
+
+  file_extents(int fd, size_t filesz, int dirextents) {
+    if(dirextents == 2)
+      grab_extents_fiemap(fd);
+    else if(dirextents == 1)
+      grab_extents_fibmap(fd, filesz);
+    else
+      throw runtime_error("file_extents: directory extents requested and operation not supported");
+  }
+
+  void grab_extents_fibmap(int fd, size_t filesz) {
+    size_t block = 0, blocksz = 0, nblocks;
+    int res;
+    while((res = ioctl(fd, FIGETBSZ, &blocksz)) < 0) {
+      if(errno != EINTR) {
+        throw runtime_error(strprintf("ioctl FTGETBSZ failed: %s", strerror(errno)));
+      }
+    }
+    nblocks = (filesz + blocksz - 1) / blocksz;
+    extents.reserve(nblocks);
+    for(size_t i=0; i < nblocks; i++) {
+      block = i;
+      while((res = ioctl(fd, FIBMAP, &block)) < 0) {
+        if(errno != EINTR) {
+          throw runtime_error(strprintf("ioctl FIBMAP failed: %s", strerror(errno)));
+        }
+      }
+      extents.push_back(
+          ffextent(true,
+            (i+1) == blocksz,
+            i * blocksz,
+            block,
+            (size_t)min(blocksz, filesz - i * blocksz)));
+    }
+  }
+
+  void grab_extents_fiemap(int fd) {
     struct fiemap extinfo;
     memset(&extinfo, 0, sizeof(struct fiemap));
 
@@ -125,6 +176,36 @@ struct file_extents {
       }
       break;
     }
+  }
+
+  static int dir_extents_test(const char * d) {
+    int fd = open(d, O_RDONLY), res;
+    if(fd < 0) {
+      throw runtime_error(strprintf("open(%s) failed: %s", d, strerror(errno)));
+    }
+
+    fd_raii r(fd);
+
+    struct fiemap foo;
+    memset(&foo, 0, sizeof(struct fiemap));
+    while((res = ioctl(fd, FS_IOC_FIEMAP, &foo)) < 0) {
+      if(errno != EINTR)
+        break;
+    }
+
+    if(res == 0)
+      return 2;
+
+    int block = 0;
+    while((res = ioctl(fd, FIBMAP, &block)) < 0) {
+      if(errno != EINTR)
+        break;
+    }
+
+    if(res == 0)
+      return 1;
+
+    return 0;
   }
 };
 
@@ -351,7 +432,7 @@ inode_metadata deserialise(const string &s, const string &xattrs) {
 
   md._xattr_data.resize(xattrs.size());
   memcpy(&md._xattr_data[0], &xattrs[0], xattrs.size());
-  
+
   int start = 0;
   bool iskey = true;
   FOR(i, md._xattr_data.size()) {
@@ -370,20 +451,11 @@ inode_metadata deserialise(const string &s, const string &xattrs) {
 
 static const int threads = 64;
 
-struct fd_raii {
-  int fd;
-  fd_raii(int fd) : fd(fd) {}
-  ~fd_raii() { close(fd); }
-};
-
-struct dir_raii {
-  DIR *d;
-  dir_raii(DIR *d) : d(d) {}
-  ~dir_raii() { closedir(d); }
-};
-
 // TODO:  If the fs supports it, use FIEMAP or FIBMAP to figure out the extents
 // of a directory.  Use the first extent instead of the inode number.
+
+int dirextents = 0;
+
 struct dirtree_walker {
   mutex mu;
   multimap<int, function<void()> > q;
@@ -873,13 +945,13 @@ void restore_data(string filename, FILE *f) {
     }
     fd_raii raii(fd);
     SAFE_SYSCALL0(lseek, fd, offset, SEEK_SET);
-  
+
     while (datalen) {
       char buf[65536];
       int zzz = min(65536, datalen);
       int len = fread(buf, 1, zzz, f);
       if (len != zzz) {
-        if (feof(f)) 
+        if (feof(f))
           throw runtime_error("fread came up short during data block "
               "read: unexpected eof");
         throw runtime_error(strprintf("fread came up short during data block "
@@ -968,6 +1040,7 @@ int main(int argc, char **argv) {
     argno++;
   }
   if (!unpack) {
+    dirextents = file_extents::dir_extents_test(argv[argno]);
     thread out([](){output.go();});
     dirtree_walker w(argv[argno]);
     w.handler = handle_dent;
