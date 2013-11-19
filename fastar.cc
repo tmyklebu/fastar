@@ -312,10 +312,10 @@ struct inode_metadata {
     switch(kind) {
       case 0: case 2: case 3: case 4: case 6:
         if (kind != 2 && kind != 3) devno = 0;
-        SAFE_SYSCALL(mknod, path, kind2S_[kind], devno);
+        SAFE_SYSCALL(mknod, path, kind2S_[kind] | 0640, devno);
         break;
       case 1:
-        SAFE_SYSCALL(mkdir, path, 0);
+        SAFE_SYSCALL(mkdir, path, 0750);
         break;
       case 5:
         SAFE_SYSCALL(symlink, maybe_linktarget, path);
@@ -323,11 +323,14 @@ struct inode_metadata {
       default:
         throw runtime_error("weird kind");
     }
-    SAFE_SYSCALL(chmod, path, (mode_t)perms);
-    SAFE_SYSCALL(lchown, path, (uid_t)uid, (gid_t)gid);
     if(kind == 0) {
       SAFE_SYSCALL(truncate, path, (off_t)size);
     }
+  }
+
+  void fixup(const char *path) {
+    SAFE_SYSCALL(chmod, path, (mode_t)perms);
+    SAFE_SYSCALL(lchown, path, (uid_t)uid, (gid_t)gid);
     struct utimbuf tb;
     tb.actime = atime;
     tb.modtime = mtime;
@@ -984,13 +987,11 @@ void restore_data(string filename, FILE *f) {
   }
 }
 
-vector<pair<string, utimbuf> > time_fixup_list;
+vector<pair<string, inode_metadata> > node_fixup_list;
 
-void fixup_times() {
-  FOR(i, time_fixup_list.size())
-    if (utime(time_fixup_list[i].first.c_str(), &time_fixup_list[i].second) < 0)
-      fprintf(stderr, "warning: couldn't fixup times for %s: %s\n",
-          time_fixup_list[i].first.c_str(), strerror(errno));
+void fixup_nodes() {
+  FOR(i, node_fixup_list.size())
+    node_fixup_list[i].second.fixup(node_fixup_list[i].first.c_str());
 }
 
 void restore(FILE *f) {
@@ -1001,19 +1002,18 @@ void restore(FILE *f) {
       case 0: case 1: {
         inode_metadata md = get_inode_md(c, f);
         md.restore(from.c_str(), 0);
-        utimbuf tb;
-        tb.actime = md.atime;
-        tb.modtime = md.mtime;
-        time_fixup_list.push_back(make_pair(from, tb));
+        node_fixup_list.push_back(make_pair(from, md));
       } break;
       case 2: case 3: case 4: case 6: {
         inode_metadata md = get_inode_md(c, f);
         md.restore(from.c_str(), 0);
+        md.fixup(from.c_str());
       } break;
       case 5: {
         inode_metadata md = get_inode_md(c, f);
         string to = read_lenprestring(f);
         md.restore(from.c_str(), to.c_str());
+        md.fixup(from.c_str());
       } break;
       case 7: { // hardlink
         string to = read_lenprestring(f);
@@ -1054,6 +1054,6 @@ int main(int argc, char **argv) {
     try {
       restore(stdin);
     } catch (eof_exception &e) {}
-    fixup_times();
+    fixup_nodes();
   }
 }
