@@ -28,7 +28,7 @@
 #include <linux/fiemap.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
-#include <utime.h>
+#include <sys/time.h>
 using namespace std;
 
 #define FOR(i,n) for (int i=0;i<n;i++)
@@ -70,10 +70,61 @@ struct ffextent {
 
 string base_dir;
 
+struct fd_raii {
+  int fd;
+  fd_raii(int fd) : fd(fd) {}
+  ~fd_raii() { close(fd); }
+};
+
+struct dir_raii {
+  DIR *d;
+  dir_raii(DIR *d) : d(d) {}
+  ~dir_raii() { closedir(d); }
+};
+
 struct file_extents {
   std::vector<ffextent> extents;
 
   file_extents(int fd) {
+    grab_extents_fiemap(fd);
+  }
+
+  file_extents(int fd, size_t filesz, int dirextents) {
+    if(dirextents == 2)
+      grab_extents_fiemap(fd);
+    else if(dirextents == 1)
+      grab_extents_fibmap(fd, filesz);
+    else
+      throw runtime_error("file_extents: directory extents requested and operation not supported");
+  }
+
+  void grab_extents_fibmap(int fd, size_t filesz) {
+    size_t block = 0, blocksz = 0, nblocks;
+    int res;
+    while((res = ioctl(fd, FIGETBSZ, &blocksz)) < 0) {
+      if(errno != EINTR) {
+        throw runtime_error(strprintf("ioctl FTGETBSZ failed: %s", strerror(errno)));
+      }
+    }
+    nblocks = (filesz + blocksz - 1) / blocksz;
+    extents.reserve(nblocks);
+    for(size_t i=0; i < nblocks; i++) {
+      block = i;
+      while((res = ioctl(fd, FIBMAP, &block)) < 0) {
+        if(errno != EINTR) {
+          throw runtime_error(strprintf("ioctl FIBMAP failed: %s", strerror(errno)));
+        }
+      }
+      extents.push_back(
+          ffextent(true,
+            (i+1) == blocksz,
+            i * blocksz,
+            block,
+            (size_t)min(blocksz, filesz - i * blocksz)));
+    }
+  }
+
+  void grab_extents_fiemap(int fd) {
     struct fiemap extinfo;
     memset(&extinfo, 0, sizeof(struct fiemap));
 
@@ -125,6 +176,36 @@ struct file_extents {
       }
       break;
     }
+  }
+
+  static int dir_extents_test(const char * d) {
+    int fd = open(d, O_RDONLY), res;
+    if(fd < 0) {
+      throw runtime_error(strprintf("open(%s) failed: %s", d, strerror(errno)));
+    }
+
+    fd_raii r(fd);
+
+    struct fiemap foo;
+    memset(&foo, 0, sizeof(struct fiemap));
+    while((res = ioctl(fd, FS_IOC_FIEMAP, &foo)) < 0) {
+      if(errno != EINTR)
+        break;
+    }
+
+    if(res == 0)
+      return 2;
+
+    int block = 0;
+    while((res = ioctl(fd, FIBMAP, &block)) < 0) {
+      if(errno != EINTR)
+        break;
+    }
+
+    if(res == 0)
+      return 1;
+
+    return 0;
   }
 };
 
@@ -231,10 +312,10 @@ struct inode_metadata {
     switch(kind) {
       case 0: case 2: case 3: case 4: case 6:
         if (kind != 2 && kind != 3) devno = 0;
-        SAFE_SYSCALL(mknod, path, kind2S_[kind], devno);
+        SAFE_SYSCALL(mknod, path, kind2S_[kind] | 0640, devno);
         break;
       case 1:
-        SAFE_SYSCALL(mkdir, path, 0);
+        SAFE_SYSCALL(mkdir, path, 0750);
         break;
       case 5:
         SAFE_SYSCALL(symlink, maybe_linktarget, path);
@@ -242,15 +323,20 @@ struct inode_metadata {
       default:
         throw runtime_error("weird kind");
     }
-    SAFE_SYSCALL(chmod, path, (mode_t)perms);
-    SAFE_SYSCALL(lchown, path, (uid_t)uid, (gid_t)gid);
     if(kind == 0) {
       SAFE_SYSCALL(truncate, path, (off_t)size);
     }
-    struct utimbuf tb;
-    tb.actime = atime;
-    tb.modtime = mtime;
-    SAFE_SYSCALL(utime, path, &tb);
+  }
+
+  void fixup(const char *path) {
+    if(kind != 5)
+      SAFE_SYSCALL(chmod, path, (mode_t)perms);
+    SAFE_SYSCALL(lchown, path, (uid_t)uid, (gid_t)gid);
+    struct timeval tv[2];
+    memset(&tv, 0, sizeof(struct timeval[2]));
+    tv[0].tv_sec = atime;
+    tv[1].tv_sec = mtime;
+    SAFE_SYSCALL(lutimes, path, tv);
     if(xattr_val_idx.size() != xattr_name_idx.size()) {
       throw runtime_error("restore: xattr_name_idx and xattr_val_idx have differing sizes");
     }
@@ -259,7 +345,12 @@ struct inode_metadata {
           &_xattr_data[xattr_name_idx.size()],
           &_xattr_data[xattr_val_idx.size()],
           strlen(&_xattr_data[xattr_val_idx.size()]), 0);
+  }
 
+  string tostring() {
+    const char * kinds[] = {"fil", "dir", "chr", "blk", "fifo", "lnk", "sock"};
+    return strprintf("%s %u:%u %o %lu %u %lu %lu %lu",
+        kinds[kind], uid, gid, perms, size, devno, atime, ctime, mtime);
   }
 
   char *xattr_name(int i) {
@@ -345,7 +436,7 @@ inode_metadata deserialise(const string &s, const string &xattrs) {
 
   md._xattr_data.resize(xattrs.size());
   memcpy(&md._xattr_data[0], &xattrs[0], xattrs.size());
-  
+
   int start = 0;
   bool iskey = true;
   FOR(i, md._xattr_data.size()) {
@@ -364,20 +455,11 @@ inode_metadata deserialise(const string &s, const string &xattrs) {
 
 static const int threads = 64;
 
-struct fd_raii {
-  int fd;
-  fd_raii(int fd) : fd(fd) {}
-  ~fd_raii() { close(fd); }
-};
-
-struct dir_raii {
-  DIR *d;
-  dir_raii(DIR *d) : d(d) {}
-  ~dir_raii() { closedir(d); }
-};
-
 // TODO:  If the fs supports it, use FIEMAP or FIBMAP to figure out the extents
 // of a directory.  Use the first extent instead of the inode number.
+
+int dirextents = 0;
+
 struct dirtree_walker {
   mutex mu;
   multimap<int, function<void()> > q;
@@ -560,7 +642,7 @@ struct outputter {
         if (errno == EINTR) continue;
         fprintf(stderr, "writev failed.  iovec was %i long:\n", vecs);
         FOR(i, vecs)
-          fprintf(stderr, "%llx %lli\n", vec[i].iov_base, vec[i].iov_len);
+          fprintf(stderr, "%p %zu\n", vec[i].iov_base, vec[i].iov_len);
         throw runtime_error(strprintf("outputter couldn't output: %s",
             strerror(errno)));
       }
@@ -867,13 +949,13 @@ void restore_data(string filename, FILE *f) {
     }
     fd_raii raii(fd);
     SAFE_SYSCALL0(lseek, fd, offset, SEEK_SET);
-  
+
     while (datalen) {
       char buf[65536];
       int zzz = min(65536, datalen);
       int len = fread(buf, 1, zzz, f);
       if (len != zzz) {
-        if (feof(f)) 
+        if (feof(f))
           throw runtime_error("fread came up short during data block "
               "read: unexpected eof");
         throw runtime_error(strprintf("fread came up short during data block "
@@ -906,13 +988,11 @@ void restore_data(string filename, FILE *f) {
   }
 }
 
-vector<pair<string, utimbuf> > time_fixup_list;
+vector<pair<string, inode_metadata> > node_fixup_list;
 
-void fixup_times() {
-  FOR(i, time_fixup_list.size())
-    if (utime(time_fixup_list[i].first.c_str(), &time_fixup_list[i].second) < 0)
-      fprintf(stderr, "warning: couldn't fixup times for %s: %s\n",
-          time_fixup_list[i].first.c_str(), strerror(errno));
+void fixup_nodes() {
+  FOR(i, node_fixup_list.size())
+    node_fixup_list[i].second.fixup(node_fixup_list[i].first.c_str());
 }
 
 void restore(FILE *f) {
@@ -923,19 +1003,18 @@ void restore(FILE *f) {
       case 0: case 1: {
         inode_metadata md = get_inode_md(c, f);
         md.restore(from.c_str(), 0);
-        utimbuf tb;
-        tb.actime = md.atime;
-        tb.modtime = md.mtime;
-        time_fixup_list.push_back(make_pair(from, tb));
+        node_fixup_list.push_back(make_pair(from, md));
       } break;
       case 2: case 3: case 4: case 6: {
         inode_metadata md = get_inode_md(c, f);
         md.restore(from.c_str(), 0);
+        md.fixup(from.c_str());
       } break;
       case 5: {
         inode_metadata md = get_inode_md(c, f);
         string to = read_lenprestring(f);
         md.restore(from.c_str(), to.c_str());
+        md.fixup(from.c_str());
       } break;
       case 7: { // hardlink
         string to = read_lenprestring(f);
@@ -962,6 +1041,7 @@ int main(int argc, char **argv) {
     argno++;
   }
   if (!unpack) {
+    dirextents = file_extents::dir_extents_test(argv[argno]);
     thread out([](){output.go();});
     dirtree_walker w(argv[argno]);
     w.handler = handle_dent;
@@ -975,6 +1055,6 @@ int main(int argc, char **argv) {
     try {
       restore(stdin);
     } catch (eof_exception &e) {}
-    fixup_times();
+    fixup_nodes();
   }
 }
