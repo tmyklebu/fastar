@@ -517,7 +517,7 @@ struct outputter {
   condition_variable qempty, qfull;
   queue<unique_ptr<pending_output> > q;
   int totsiz;
-  atomic<int> done;
+  int done;
 
   outputter() {
     totsiz = 0;
@@ -723,7 +723,7 @@ struct data_grabber {
   }
 
   void coalesce() {
-    // TODO
+    // TODO: break up big reads and mash together little reads.
   }
 
   int add(const string &name, const inode_metadata &md) {
