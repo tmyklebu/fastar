@@ -28,7 +28,7 @@
 #include <linux/fiemap.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
-#include <utime.h>
+#include <sys/time.h>
 using namespace std;
 
 #define FOR(i,n) for (int i=0;i<n;i++)
@@ -329,12 +329,14 @@ struct inode_metadata {
   }
 
   void fixup(const char *path) {
-    SAFE_SYSCALL(chmod, path, (mode_t)perms);
+    if(kind != 5)
+      SAFE_SYSCALL(chmod, path, (mode_t)perms);
     SAFE_SYSCALL(lchown, path, (uid_t)uid, (gid_t)gid);
-    struct utimbuf tb;
-    tb.actime = atime;
-    tb.modtime = mtime;
-    SAFE_SYSCALL(utime, path, &tb);
+    struct timeval tv[2];
+    memset(&tv, 0, sizeof(struct timeval[2]));
+    tv[0].tv_sec = atime;
+    tv[1].tv_sec = mtime;
+    SAFE_SYSCALL(lutimes, path, tv);
     if(xattr_val_idx.size() != xattr_name_idx.size()) {
       throw runtime_error("restore: xattr_name_idx and xattr_val_idx have differing sizes");
     }
@@ -343,7 +345,6 @@ struct inode_metadata {
           &_xattr_data[xattr_name_idx.size()],
           &_xattr_data[xattr_val_idx.size()],
           strlen(&_xattr_data[xattr_val_idx.size()]), 0);
-
   }
 
   string tostring() {
@@ -641,7 +642,7 @@ struct outputter {
         if (errno == EINTR) continue;
         fprintf(stderr, "writev failed.  iovec was %i long:\n", vecs);
         FOR(i, vecs)
-          fprintf(stderr, "%llx %lli\n", vec[i].iov_base, vec[i].iov_len);
+          fprintf(stderr, "%p %zu\n", vec[i].iov_base, vec[i].iov_len);
         throw runtime_error(strprintf("outputter couldn't output: %s",
             strerror(errno)));
       }
