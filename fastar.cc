@@ -837,7 +837,43 @@ struct data_grabber {
   }
 
   void coalesce() {
-    // TODO: break up big reads and mash together little reads.
+    static const uint64_t max_read_chunk_size = 32<<20;
+    // break up the big reads.
+    vector<pair<uint64_t, pair<string, vector<ffextent> > > > newwork;
+    FOR(i, bigwork.size()) {
+      string &filename = bigwork[i].second.first;
+      vector<ffextent> &exts = bigwork[i].second.second;
+      vector<ffextent> eout;
+      int cursz = 0;
+      FOR(j, exts.size()) {
+        again:
+        if (cursz + exts[j].len <= max_read_chunk_size)
+          eout.push_back(exts[j]);
+        else if (eout.size()) {
+          newwork.push_back(make_pair(bigwork[i].first,
+              make_pair(bigwork[i].second.first, eout)));
+          eout.clear();
+          goto again;
+        } else {
+          ffextent e = exts[j];
+          while (e.len > 0) {
+            ffextent f = e;
+            f.len = min(e.len, max_read_chunk_size);
+            newwork.push_back(make_pair(f.blk,
+                make_pair(filename, vector<ffextent>(1, f))));
+            e.off += f.len;
+            e.len -= f.len;
+	    e.blk += f.len;
+          }
+        }
+      }
+    }
+
+    // TODO: deal with small chunks belonging to the same file...somehow.
+    FOR(i, smallwork.size()) newwork.push_back(smallwork[i]);
+
+    smallwork.swap(newwork);
+    bigwork.clear();
   }
 
   int add(const string &name, const inode_metadata &md) {
