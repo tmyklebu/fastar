@@ -473,12 +473,6 @@ struct inode_metadata {
   int nxattrs() const { return xattr_name_idx.size(); }
 };
 
-// A work queue.  Each piece of work is a function<void()> with an integer key.
-// If a work has just finished a task with key k, it is assumed to be much
-// easier to do a task whose key is only a little larger than k than something
-// wildly different from k; this can be suitable when the key is a disk block
-// or something.
-
 struct workqueue_base {
   mutex mu;
   condition_variable cv;

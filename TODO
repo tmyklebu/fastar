@@ -1,6 +1,6 @@
 [X] clean up all the different workqueues; factor out the workqueue logic.
 [ ] write coalesce
 [ ] output order screwiness --- get files that live close together in path close together on the target system.
-[ ] clean up serialisation/deserialisation.
+[X] clean up serialisation/deserialisation.
 [ ] longer-term:  aio
-[ ] endianness
+[X] endianness
