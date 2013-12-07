@@ -29,7 +29,12 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <stdint.h>
 using namespace std;
+
+// Machine-specific configuration
+static int dirextents = 0;
+static int pagesize = 0;
 
 #define FOR(i,n) for (int i=0;i<n;i++)
 
@@ -44,21 +49,31 @@ string strprintf(const char *fmt, ...) {
   return ans;
 }
 
-string int2string(int sz) {
-  string p((char *)&sz, (char *)(&sz+1));
+template<typename T>
+string T2string(T x) {
+  static const int size = sizeof(T);
+  string p(size, 0);
+  FOR(i, size) p[i] = (x >> 8*(size - i - 1)) & 0xFF;
   return p;
 }
-int string2int(const string &s) {
-  return *(int *)&s[0];
+template<typename T>
+T string2T(const string &s) {
+  const unsigned char *p = (const unsigned char*)&s[0];
+  static const int size = sizeof(T);
+  T res = 0;
+  FOR(i, size) res |= p[i] << 8*(size - i - 1);
+  return res;
 }
-string ll2string(long long sz) {
-  string p((char *)&sz, (char *)(&sz+1));
-  return p;
+template<typename T>
+T cstring2T(const unsigned char ** s) {
+  static const int size = sizeof(T);
+  T res = 0;
+  FOR(i, size) res |= (*s)[i] << 8*(size - i - 1);
+  *s += size;
+  return res;
 }
 string length_prefixed(const string &s) {
-  int sz = s.size();
-  string p((char *)&sz, (char *)(&sz+1));
-  return p+s;
+  return T2string<uint64_t>(s.size())+s;
 }
 
 struct ffextent {
@@ -141,8 +156,6 @@ struct file_extents {
       size_t len = sizeof(struct fiemap)
                  + extinfo.fm_mapped_extents * sizeof(struct fiemap_extent);
       struct fiemap * exts = (struct fiemap *)alloca(len);
-      // XXX HACK:  Make valgrind shut up.
-      //memset(exts, 0, sizeof(struct fiemap));
       memset(exts, 0, len);
 
       exts->fm_start = 0;
@@ -210,13 +223,90 @@ struct file_extents {
 };
 
 struct inode_metadata {
-  int kind; // regular, device, etc.
-  int ino;
-  int uid, gid;
-  int perms;
-  size_t size;
-  dev_t devno;
-  time_t atime, ctime, mtime;
+  uint8_t kind; // regular, device, etc.
+  uint64_t ino;
+  uint16_t uid, gid;
+  uint16_t perms;
+  uint64_t size;
+  uint32_t devno;
+  uint64_t atime_sec, atime_nsec, mtime_sec, mtime_nsec;
+
+  vector<char> _xattr_data;
+  vector<int> xattr_name_idx;
+  vector<int> xattr_val_idx;
+  vector<pair<int, int> > extents;
+
+  inode_metadata(const string & body, const string & xattrs) {
+    const unsigned char * s = (const unsigned char *)&body[0];
+    assert(body.size() == bodysize());
+
+    kind = cstring2T<int8_t>(&s);
+    ino = cstring2T<uint64_t>(&s);
+    uid = cstring2T<uint16_t>(&s);
+    gid = cstring2T<uint16_t>(&s);
+    perms = cstring2T<uint16_t>(&s);
+    size = cstring2T<uint64_t>(&s);
+    atime_sec = cstring2T<uint64_t>(&s);
+    atime_nsec = cstring2T<uint64_t>(&s);
+    mtime_sec = cstring2T<uint64_t>(&s);
+    mtime_nsec = cstring2T<uint64_t>(&s);
+
+    _xattr_data.resize(xattrs.size());
+    memcpy(&_xattr_data[0], &xattrs[0], xattrs.size());
+
+    int start = 0;
+    bool iskey = true;
+    FOR(i, _xattr_data.size()) {
+      if(_xattr_data[i] == '\0') {
+        if(iskey) {
+          xattr_name_idx.push_back(start);
+        } else {
+          xattr_val_idx.push_back(start);
+        }
+        start = i+1;
+        iskey = ~iskey;
+      }
+    }
+  }
+
+  inode_metadata() {}
+
+  string serialise() const {
+    string xattrs;
+    FOR(i, xattr_name_idx.size()) {
+      xattrs += &_xattr_data[xattr_name_idx[i]];
+      xattrs += '\0';
+      xattrs += &_xattr_data[xattr_val_idx[i]];
+      xattrs += '\0';
+    }
+
+    return
+        T2string<int8_t>(kind)
+      + T2string<uint64_t>(ino)
+      + T2string<uint16_t>(uid)
+      + T2string<uint16_t>(gid)
+      + T2string<uint16_t>(perms)
+      + T2string<uint64_t>(size)
+      + T2string<uint64_t>(atime_sec)
+      + T2string<uint64_t>(atime_nsec)
+      + T2string<uint64_t>(mtime_sec)
+      + T2string<uint64_t>(mtime_nsec)
+      + length_prefixed(xattrs);
+  }
+
+  static size_t bodysize() {
+    return
+        sizeof(kind)
+      + sizeof(ino)
+      + sizeof(uid)
+      + sizeof(gid)
+      + sizeof(perms)
+      + sizeof(size)
+      + sizeof(atime_sec)
+      + sizeof(atime_nsec)
+      + sizeof(mtime_sec)
+      + sizeof(mtime_nsec);
+  }
 
   void fill_stat_md(const struct stat &st) {
     if (S_ISREG(st.st_mode)) kind = 0;
@@ -233,15 +323,11 @@ struct inode_metadata {
     perms = st.st_mode & 0xffff;
     size = st.st_size;
     devno = st.st_rdev;
-    atime = st.st_atime;
-    mtime = st.st_mtime;
-    ctime = st.st_ctime;
+    atime_sec = st.st_atim.tv_sec;
+    atime_nsec = st.st_atim.tv_nsec;
+    mtime_sec = st.st_mtim.tv_sec;
+    mtime_nsec = st.st_mtim.tv_nsec;
   }
-
-  vector<char> _xattr_data;
-  vector<int> xattr_name_idx;
-  vector<int> xattr_val_idx;
-  vector<pair<int, int> > extents;
 
   void fill_xattr_md(function<ssize_t(char *, size_t)> listxa,
                      function<ssize_t(const char*, void*, size_t)> getxa) {
@@ -290,8 +376,6 @@ struct inode_metadata {
                       return fgetxattr(fd,n,v,s); });
   }
 
-  inode_metadata() {}
-
 #define SAFE_SYSCALL(f, p, ...) do {\
   while(f(p, ##__VA_ARGS__) < 0) {\
     if(errno != EINTR) {\
@@ -332,11 +416,6 @@ struct inode_metadata {
     if(kind != 5)
       SAFE_SYSCALL(chmod, path, (mode_t)perms);
     SAFE_SYSCALL(lchown, path, (uid_t)uid, (gid_t)gid);
-    struct timeval tv[2];
-    memset(&tv, 0, sizeof(struct timeval[2]));
-    tv[0].tv_sec = atime;
-    tv[1].tv_sec = mtime;
-    SAFE_SYSCALL(lutimes, path, tv);
     if(xattr_val_idx.size() != xattr_name_idx.size()) {
       throw runtime_error("restore: xattr_name_idx and xattr_val_idx have differing sizes");
     }
@@ -345,13 +424,23 @@ struct inode_metadata {
           &_xattr_data[xattr_name_idx.size()],
           &_xattr_data[xattr_val_idx.size()],
           strlen(&_xattr_data[xattr_val_idx.size()]), 0);
+    struct timespec ts[2];
+    memset(&ts, 0, sizeof(struct timespec[2]));
+    ts[0].tv_sec = atime_sec;
+    ts[0].tv_nsec = atime_nsec;
+    ts[1].tv_sec = mtime_sec;
+    ts[1].tv_nsec = mtime_nsec;
+    SAFE_SYSCALL0(utimensat, AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW);
+    fprintf(stderr, "utimensat %s : %lu %lu %lu %lu\n", path, atime_sec, atime_nsec, mtime_sec, mtime_nsec);
   }
 
+  /* XXX
   string tostring() {
     const char * kinds[] = {"fil", "dir", "chr", "blk", "fifo", "lnk", "sock"};
     return strprintf("%s %u:%u %o %lu %u %lu %lu %lu",
         kinds[kind], uid, gid, perms, size, devno, atime, ctime, mtime);
   }
+  */
 
   char *xattr_name(int i) {
     return &_xattr_data[xattr_name_idx[i]];
@@ -380,85 +469,10 @@ struct inode_metadata {
   int nxattrs() const { return xattr_name_idx.size(); }
 };
 
-struct s_inode_metadata_hdr {
-  char kind;
-  ino_t ino;
-  int uid, gid;
-  size_t size;
-  unsigned short perms;
-  time_t atime, ctime, mtime;
-} __attribute__((packed));
-
-string serialise(const inode_metadata &md) {
-  s_inode_metadata_hdr h;
-  h.kind = md.kind;
-  h.ino = md.ino;
-  h.uid = md.uid;
-  h.gid = md.gid;
-  h.perms = md.perms;
-  h.atime = md.atime;
-  h.ctime = md.ctime;
-  h.mtime = md.mtime;
-  h.size = md.size;
-  string ans((char *)&h, (char *)&h + sizeof(s_inode_metadata_hdr));
-  if (h.kind == 2 || h.kind == 3) {
-    ans += md.devno & 255;
-    ans += md.devno >> 8 & 255;
-  }
-  string xattrs;
-  FOR(i, md.nxattrs()) {
-    xattrs += md.xattr_name(i);
-    xattrs += '\0';
-    xattrs += md.xattr_val(i);
-    xattrs += '\0';
-  }
-  ans += length_prefixed(xattrs);
-  return ans;
-}
-
-inode_metadata deserialise(const string &s, const string &xattrs) {
-  const s_inode_metadata_hdr &h = *(s_inode_metadata_hdr*)&s[0];
-  const char *cdr = &s[0] + sizeof(s_inode_metadata_hdr);
-  inode_metadata md;
-  md.kind = h.kind;
-  md.ino = h.ino;
-  md.uid = h.uid;
-  md.gid = h.gid;
-  md.perms = h.perms;
-  md.atime = h.atime;
-  md.ctime = h.ctime;
-  md.mtime = h.mtime;
-  md.size = h.size;
-  if (h.kind == 2 || h.kind == 3) {
-    md.devno = cdr[1] << 8 | cdr[0];
-    cdr += 2;
-  }
-
-  md._xattr_data.resize(xattrs.size());
-  memcpy(&md._xattr_data[0], &xattrs[0], xattrs.size());
-
-  int start = 0;
-  bool iskey = true;
-  FOR(i, md._xattr_data.size()) {
-    if(md._xattr_data[i] == '\0') {
-      if(iskey) {
-        md.xattr_name_idx.push_back(start);
-      } else {
-        md.xattr_val_idx.push_back(start);
-      }
-      start = i+1;
-      iskey = ~iskey;
-    }
-  }
-  return md;
-}
-
 static const int threads = 64;
 
 // TODO:  If the fs supports it, use FIEMAP or FIBMAP to figure out the extents
 // of a directory.  Use the first extent instead of the inode number.
-
-int dirextents = 0;
 
 struct dirtree_walker {
   mutex mu;
@@ -519,9 +533,9 @@ struct dirtree_walker {
       ino_t ino = de.d_ino;
       try {
         inode_metadata md(name.c_str());
+        handler(name, md);
         if (md.kind == 1)
           pushit(ino,[name,this]{scan_directory(name);});
-        handler(name, md);
       } catch (exception &e) {
         fprintf(stderr, "while processing %s: %s\n", name.c_str(), e.what());
         throw e;
@@ -703,10 +717,10 @@ struct data_grabber {
   int done;
 
   void doio(const pending_io &p) {
-    char *_buf = new char[p.len + 4096];
+    char *_buf = new char[p.len + pagesize];
     unique_ptr<char[]> argh(_buf);
     char *buf = _buf;
-    buf += 4096 - ((intptr_t)buf & 4095);
+    buf += pagesize - ((intptr_t)buf & (pagesize - 1));
     sadface:
     int fd = open(p.file.c_str(), O_RDONLY | O_DIRECT);
     while (fd < 0) {
@@ -744,8 +758,8 @@ struct data_grabber {
     string hdr;
     hdr += length_prefixed(p.file);
     hdr += "d";
-    hdr += ll2string(p.off);
-    hdr += int2string(fub-buf);
+    hdr += T2string<uint64_t>(p.off);
+    hdr += T2string<uint64_t>(fub-buf);
     enqueue_datapkt(hdr, _buf, buf-_buf, fub-buf);
   }
 
@@ -861,10 +875,10 @@ void handle_dent(const string &name, const inode_metadata &md) {
   string prefix = length_prefixed(name);
   switch (md.kind) {
     case 1: case 2: case 3: case 4: case 6: {
-      enqueue_block(prefix + serialise(md));
+      enqueue_block(prefix + md.serialise());
     } break;
     case 5: {
-      string foo = prefix + serialise(md);
+      string foo = prefix + md.serialise();
       char buf[8192];
       while (1) {
         int len = readlink(name.c_str(), buf, 8192);
@@ -880,7 +894,7 @@ void handle_dent(const string &name, const inode_metadata &md) {
     } break;
     case 0: {
       if (!grab.add(name, md))
-        enqueue_block(prefix + serialise(md));
+        enqueue_block(prefix + md.serialise());
     } break;
     default: throw runtime_error(strprintf("weird kind %i", md.kind));
   }
@@ -907,8 +921,9 @@ int bytes_read = 0;
       } while (0)
 
 string read_lenprestring(FILE *f) {
-  int len;
-  FREAD_EOF(&len, 1, 4);
+  string bfr(8,'\0');
+  FREAD_EOF(&bfr[0], 1, 8);
+  uint64_t len = string2T<uint64_t>(bfr);
   string s(len, '\0');
   FREAD(&s[0], 1, len);
   return s;
@@ -916,10 +931,10 @@ string read_lenprestring(FILE *f) {
 
 inode_metadata get_inode_md(char kind, FILE * f) {
   ungetc(kind, f);
-  char bfr1[sizeof(s_inode_metadata_hdr) + 6];
+  char bfr1[inode_metadata::bodysize() + 6];
   char * p = bfr1;
-  FREAD(p, sizeof(s_inode_metadata_hdr), 1);
-  p += sizeof(s_inode_metadata_hdr);
+  FREAD(p, inode_metadata::bodysize(), 1);
+  p += inode_metadata::bodysize();
   if(kind == 2 || kind == 3) {
     FREAD(p, 1, 2);
     p += 2;
@@ -928,16 +943,18 @@ inode_metadata get_inode_md(char kind, FILE * f) {
   string xattrs = read_lenprestring(f);
   string allbfr = string(bfr1, p);
 
-  return deserialise(allbfr, xattrs);
+  return inode_metadata(allbfr, xattrs);
 }
 
 bool dry_run = false;
 
 void restore_data(string filename, FILE *f) {
-  unsigned long long offset;
-  FREAD(&offset, 8, 1);
-  int datalen;
-  FREAD(&datalen, 4, 1);
+  static const uint64_t block_size = 65536;
+  string lbfr(8, '\0');
+  FREAD(&lbfr[0], 1, 8);
+  uint64_t offset = string2T<uint64_t>(lbfr);
+  FREAD(&lbfr[0], 1, 8);
+  uint64_t datalen = string2T<uint64_t>(lbfr);
 
   if (!dry_run) {
     sadface:
@@ -951,10 +968,10 @@ void restore_data(string filename, FILE *f) {
     SAFE_SYSCALL0(lseek, fd, offset, SEEK_SET);
 
     while (datalen) {
-      char buf[65536];
-      int zzz = min(65536, datalen);
-      int len = fread(buf, 1, zzz, f);
-      if (len != zzz) {
+      char buf[block_size];
+      int to_read = min(block_size, datalen);
+      int len = fread(buf, 1, to_read, f);
+      if (len != to_read) {
         if (feof(f))
           throw runtime_error("fread came up short during data block "
               "read: unexpected eof");
@@ -979,9 +996,9 @@ void restore_data(string filename, FILE *f) {
     }
   } else {
     while (datalen) {
-      char buf[65536];
-      int zzz = min(65536, datalen);
-      int len = fread(buf, 1, zzz, f);
+      char buf[block_size];
+      int to_read = min(block_size, datalen);
+      int len = fread(buf, 1, to_read, f);
       fprintf(stderr, "I want to write %i bytes; %i remain.\n", len, datalen);
       datalen -= len;
     }
@@ -1039,6 +1056,11 @@ int main(int argc, char **argv) {
       exit(-1);
     }
     argno++;
+  }
+  pagesize = sysconf(_SC_PAGESIZE);
+  if(pagesize < 1) {
+    fprintf(stderr, "bad: sysconf(_SC_PAGESIZE) = %d\n", pagesize);
+    exit(-1);
   }
   if (!unpack) {
     dirextents = file_extents::dir_extents_test(argv[argno]);
