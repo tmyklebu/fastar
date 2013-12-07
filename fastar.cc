@@ -33,8 +33,13 @@
 using namespace std;
 
 // Machine-specific configuration
-static int dirextents = 0;
+
 static int pagesize = 0;
+
+// TODO:  If the fs supports it, use FIEMAP or FIBMAP to figure out the extents
+// of a directory.  Use the first extent instead of the inode number.
+
+static int dirextents = 0;
 
 #define FOR(i,n) for (int i=0;i<n;i++)
 
@@ -118,7 +123,7 @@ struct file_extents {
     int res;
     while((res = ioctl(fd, FIGETBSZ, &blocksz)) < 0) {
       if(errno != EINTR) {
-        throw runtime_error(strprintf("ioctl FTGETBSZ failed: %s", strerror(errno)));
+        throw runtime_error(strprintf("ioctl FIGETBSZ failed: %s", strerror(errno)));
       }
     }
     nblocks = (filesz + blocksz - 1) / blocksz;
@@ -431,7 +436,6 @@ struct inode_metadata {
     ts[1].tv_sec = mtime_sec;
     ts[1].tv_nsec = mtime_nsec;
     SAFE_SYSCALL0(utimensat, AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW);
-    fprintf(stderr, "utimensat %s : %lu %lu %lu %lu\n", path, atime_sec, atime_nsec, mtime_sec, mtime_nsec);
   }
 
   /* XXX
@@ -469,25 +473,56 @@ struct inode_metadata {
   int nxattrs() const { return xattr_name_idx.size(); }
 };
 
-static const int threads = 64;
+// A work queue.  Each piece of work is a function<void()> with an integer key.
+// If a work has just finished a task with key k, it is assumed to be much
+// easier to do a task whose key is only a little larger than k than something
+// wildly different from k; this can be suitable when the key is a disk block
+// or something.
 
-// TODO:  If the fs supports it, use FIEMAP or FIBMAP to figure out the extents
-// of a directory.  Use the first extent instead of the inode number.
-
-struct dirtree_walker {
+struct workqueue_base {
   mutex mu;
-  multimap<int, function<void()> > q;
   condition_variable cv;
-  int done;
+  bool done;
 
-  void pushit(int key, function<void()> f) {
+  vector<thread> vt;
+  bool joined;
+
+  virtual void worker() = 0;
+
+  workqueue_base() {
+    done = false;
+    joined = false;
+  }
+
+  void start(int threads) {
+    for (int i = 0; i < threads; i++)
+      vt.push_back(thread([this](){worker();}));
+  }
+
+  virtual ~workqueue_base() {
+    if (!joined) join();
+  }
+
+  void join() {
+    done = true;
+    cv.notify_all();
+    for (int i = 0; i < vt.size(); i++)
+      vt[i].join();
+    joined = true;
+  }
+};
+
+struct disk_workqueue : workqueue_base {
+  multimap<int, function<void()> > q;
+
+  void push(key_t key, function<void()> f) {
     lock_guard<mutex> g(mu);
     q.insert(make_pair(key, f));
     cv.notify_one();
   }
 
-  void processing_thread() {
-    int lastino = 0;
+  void worker() {
+    key_t lastkey = 0;
     while (1) {
       function<void()> f;
       {
@@ -496,9 +531,8 @@ struct dirtree_walker {
           if (done) return;
           cv.wait(lg);
         }
-        auto it = q.lower_bound(lastino);
+        auto it = q.lower_bound(lastkey);
         if (it == q.end()) it = q.begin();
-        lastino = it->first;
         f = it->second;
         q.erase(it);
       }
@@ -506,7 +540,13 @@ struct dirtree_walker {
     }
   }
 
-  function<void(const string &, const inode_metadata &)> handler;
+  disk_workqueue(int threads = 64) : workqueue_base() { start(threads); }
+};
+
+struct dirtree_walker : disk_workqueue {
+  typedef function<void(const string &, const inode_metadata &)> handler_t;
+
+  handler_t handler;
 
   int scan_directory(string dir) {
     DIR *d = opendir(dir.c_str());
@@ -535,7 +575,7 @@ struct dirtree_walker {
         inode_metadata md(name.c_str());
         handler(name, md);
         if (md.kind == 1)
-          pushit(ino,[name,this]{scan_directory(name);});
+          push(ino, [name,this]{scan_directory(name);});
       } catch (exception &e) {
         fprintf(stderr, "while processing %s: %s\n", name.c_str(), e.what());
         throw e;
@@ -545,19 +585,9 @@ struct dirtree_walker {
     return 0;
   }
 
-  dirtree_walker(const char *dt) {
-    done = 0;
-    pushit(0, [dt,this]{scan_directory(dt); return 0;});
-  }
-
-  void go() {
-    vector<thread> vt;
-    for (int i = 0; i < threads; i++)
-      vt.push_back(thread([this](){processing_thread();}));
-    done = 1;
-    cv.notify_all();
-    for (int i = 0; i < threads; i++)
-      vt[i].join();
+  dirtree_walker(const char *dt, handler_t handler, int threads = 64)
+      : disk_workqueue(threads), handler(handler) {
+    push(0, [dt,this]{scan_directory(dt); return 0;});
   }
 };
 
@@ -608,34 +638,32 @@ struct pending_datapkt_output : pending_output {
   }
 };
 
-struct outputter {
-  mutex mu;
-  condition_variable qempty, qfull;
+struct outputter : workqueue_base {
   queue<unique_ptr<pending_output> > q;
   int totsiz;
-  int done;
-
-  outputter() {
-    totsiz = 0;
-    done = 0;
-  }
+  condition_variable qfull;
 
   void push(unique_ptr<pending_output> po, size_t siz) {
     unique_lock<mutex> lg(mu);
     while (totsiz > (64<<20)) qfull.wait(lg);
     q.push(move(po));
     totsiz += siz;
-    qempty.notify_all();
+    cv.notify_all();
   }
 
-  void go() {
+  outputter() : workqueue_base() {
+    totsiz = 0;
+    start(1);
+  }
+
+  void worker() {
     while (1) {
       unique_ptr<pending_output> po;
       vector<iovec> iov;
       { unique_lock<mutex> lg(mu);
         while (!q.size()) {
           if (done) return;
-          qempty.wait(lg);
+          cv.wait(lg);
         }
         po = move(q.front());
         q.pop();
@@ -695,28 +723,38 @@ namespace std {
   bool operator<(const vector<T> &, const vector<T> &) { return false; }
 }
 
-struct data_grabber {
+struct inode_canon {
   mutex mu;
-  unordered_map<ino_t, string> inode_canon;
-  vector<pair<uint64_t, pair<string, vector<ffextent> > > > bigwork, smallwork;
+  unordered_map<ino_t, string> m;
 
-  // mashed together two concerns here; fix.  note reuse of mu.
-  struct pending_io {
-    string file;
-    uint64_t blk;
-    uint64_t off, len;
-    int last;
-    bool operator<(const pending_io &p) const { return blk < p.blk; }
-    pending_io(){}
-    pending_io(string s, ffextent e)
-      : file(s), blk(e.blk), off(e.off), len(e.len), last(e.last) {}
-  };
+  bool canon(ino_t inode, string &s) {
+    lock_guard<mutex> lg(mu);
+    if (m.count(inode)) {
+      s = m[inode];
+      return true;
+    }
+    else {
+      m[inode] = s;
+      return false;
+    }
+  }
+} ino_can;
 
-  multiset<pending_io> bigpend, smallpend;
-  condition_variable bigcv, smallcv;
-  int done;
+struct pending_io {
+  string file;
+  uint64_t blk;
+  uint64_t off, len;
+  int last;
+  bool operator<(const pending_io &p) const { return blk < p.blk; }
+  pending_io(){}
+  pending_io(string s, ffextent e)
+    : file(s), blk(e.blk), off(e.off), len(e.len), last(e.last) {}
+};
 
-  void doio(const pending_io &p) {
+struct data_workqueue : workqueue_base {
+  multiset<pending_io> pend;
+
+  static void doio(const pending_io &p) {
     char *_buf = new char[p.len + pagesize];
     unique_ptr<char[]> argh(_buf);
     char *buf = _buf;
@@ -733,9 +771,6 @@ struct data_grabber {
       if (errno != EINTR)
         throw runtime_error(strprintf("lseek: %s", strerror(errno)));
     }
-    if (0)
-    fprintf(stderr, "asked to read %i bytes from %s starting at %i\n",
-        (int)p.len, p.file.c_str(), (int)p.off);
     int left = p.len;
     char *fub = buf;
     while (left) {
@@ -763,7 +798,7 @@ struct data_grabber {
     enqueue_datapkt(hdr, _buf, buf-_buf, fub-buf);
   }
 
-  void consumer(multiset<pending_io> &pend, condition_variable &cv) {
+  void worker() {
     uint64_t last_blk = rand();
     while (1) {
       pending_io p;
@@ -783,55 +818,86 @@ struct data_grabber {
     }
   }
 
+  void push(pending_io &&pe) {
+    unique_lock<mutex> lk(mu);
+    pend.insert(move(pe));
+    cv.notify_one();
+  }
+};
+
+struct data_grabber {
+  mutex mu;
+  vector<pair<uint64_t, pair<string, vector<ffextent> > > > bigwork, smallwork;
+  data_workqueue big, small;
+
   void doit() {
     static const int grab_nthread = 16;
     static const int small_grab_nthread = 64;
-    vector<thread> vt;
-    FOR(i, grab_nthread)
-      vt.push_back(thread([this](){consumer(bigpend, bigcv);}));
-    FOR(i, small_grab_nthread)
-      vt.push_back(thread([this](){consumer(smallpend, smallcv);}));
+    static const int bigness_threshold = 65536; // bytes
+    big.start(grab_nthread); small.start(small_grab_nthread);
     FOR(i, bigwork.size())
-      FOR(j, bigwork[i].second.second.size()) {
-        unique_lock<mutex> lg(mu);
-        const string &foo = bigwork[i].second.first;
-        bigpend.insert(pending_io(foo, bigwork[i].second.second[j]));
-        bigcv.notify_one();
-      }
+      FOR(j, bigwork[i].second.second.size())
+        big.push(pending_io(bigwork[i].second.first,
+                            bigwork[i].second.second[j]));
+
     sort(smallwork.begin(), smallwork.end());
     FOR(i, smallwork.size())
       FOR(j, smallwork[i].second.second.size()) {
-        unique_lock<mutex> lg(mu);
         const string &foo = smallwork[i].second.first;
         ffextent &e = smallwork[i].second.second[j];
-        if (e.len > 65536) {
-          bigpend.insert(pending_io(foo, e));
-          bigcv.notify_one();
-        } else {
-          smallpend.insert(pending_io(foo, e));
-          smallcv.notify_one();
-        }
+        if (e.len > bigness_threshold) big.push(pending_io(foo, e));
+        else small.push(pending_io(foo, e));
       }
-    done = 1;
-    bigcv.notify_all();
-    smallcv.notify_all();
-    FOR(i, vt.size()) vt[i].join();
+    big.join(); small.join();
   }
 
   void coalesce() {
-    // TODO: break up big reads and mash together little reads.
+    static const uint64_t max_read_chunk_size = 32<<20;
+    // break up the big reads.
+    vector<pair<uint64_t, pair<string, vector<ffextent> > > > newwork;
+    FOR(i, bigwork.size()) {
+      string &filename = bigwork[i].second.first;
+      vector<ffextent> &exts = bigwork[i].second.second;
+      vector<ffextent> eout;
+      int cursz = 0;
+      FOR(j, exts.size()) {
+        again:
+        if (cursz + exts[j].len <= max_read_chunk_size)
+          eout.push_back(exts[j]);
+        else if (eout.size()) {
+          newwork.push_back(make_pair(bigwork[i].first,
+              make_pair(bigwork[i].second.first, eout)));
+          eout.clear();
+          goto again;
+        } else {
+          ffextent e = exts[j];
+          while (e.len > 0) {
+            ffextent f = e;
+            f.len = min(e.len, max_read_chunk_size);
+            newwork.push_back(make_pair(f.blk,
+                make_pair(filename, vector<ffextent>(1, f))));
+            e.off += f.len;
+            e.len -= f.len;
+	    e.blk += f.len;
+          }
+        }
+      }
+    }
+
+    // TODO: deal with small chunks belonging to the same file...somehow.
+    FOR(i, smallwork.size()) newwork.push_back(smallwork[i]);
+
+    smallwork.swap(newwork);
+    bigwork.clear();
   }
 
   int add(const string &name, const inode_metadata &md) {
-    { lock_guard<mutex> lg(mu);
-      if (inode_canon.count(md.ino)) {
-        // hard links
-        string block = length_prefixed(name) + "\007"
-            + length_prefixed(inode_canon[md.ino]);
-        enqueue_block(block);
-        return 1;
-      }
-      inode_canon[md.ino] = name;
+    string newname = name;
+    if (ino_can.canon(md.ino, newname)) {
+      string block = length_prefixed(name) + "\007"
+          + length_prefixed(newname);
+      enqueue_block(block);
+      return 1;
     }
 
     sadface:
@@ -851,18 +917,10 @@ struct data_grabber {
       file_extents ext(fd);
       size_t totlen = 0;
       FOR(i, ext.extents.size()) totlen += ext.extents[i].len;
-      if (totlen == 0) {
-        return 0;
-      }
-      if (totlen > (32<<20)) {
-        lock_guard<mutex> lg(mu);
-        bigwork.push_back(make_pair(ext.extents[0].blk,
-            make_pair(name, ext.extents)));
-      } else {
-        lock_guard<mutex> lg(mu);
-        smallwork.push_back(make_pair(ext.extents[0].blk,
-            make_pair(name, ext.extents)));
-      }
+      if (totlen == 0) return 0;
+      lock_guard<mutex> lg(mu);
+      (totlen > 32<<20 ? bigwork : smallwork).push_back(make_pair(
+          ext.extents[0].blk, make_pair(name, ext.extents)));
     } catch (exception &e) {
       fprintf(stderr, "warning: failed to fetch extents for %s: %s\n",
            name.c_str(), e.what());
@@ -1064,15 +1122,13 @@ int main(int argc, char **argv) {
   }
   if (!unpack) {
     dirextents = file_extents::dir_extents_test(argv[argno]);
-    thread out([](){output.go();});
-    dirtree_walker w(argv[argno]);
-    w.handler = handle_dent;
-    w.go();
+    dirtree_walker w(argv[argno], handle_dent);
+    w.join();
     grab.coalesce();
     grab.doit();
     output.done = 1;
-    output.qempty.notify_all();
-    out.join();
+    output.cv.notify_all();
+    output.join();
   } else {
     try {
       restore(stdin);
