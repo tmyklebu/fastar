@@ -66,14 +66,14 @@ T string2T(const string &s) {
   const unsigned char *p = (const unsigned char*)&s[0];
   static const int size = sizeof(T);
   T res = 0;
-  FOR(i, size) res |= p[i] << 8*(size - i - 1);
+  FOR(i, size) res |= (unsigned long long)(p[i]) << 8*(size - i - 1);
   return res;
 }
 template<typename T>
 T cstring2T(const unsigned char ** s) {
   static const int size = sizeof(T);
   T res = 0;
-  FOR(i, size) res |= (*s)[i] << 8*(size - i - 1);
+  FOR(i, size) res |= (unsigned long long)((*s)[i]) << 8*(size - i - 1);
   *s += size;
   return res;
 }
@@ -498,8 +498,11 @@ struct workqueue_base {
   }
 
   void join() {
-    done = true;
-    cv.notify_all();
+    {
+      lock_guard<mutex> lg(mu);
+      done = true;
+      cv.notify_all();
+    }
     for (int i = 0; i < vt.size(); i++)
       vt[i].join();
     joined = true;
@@ -1120,8 +1123,6 @@ int main(int argc, char **argv) {
     w.join();
     grab.coalesce();
     grab.doit();
-    output.done = 1;
-    output.cv.notify_all();
     output.join();
   } else {
     try {
