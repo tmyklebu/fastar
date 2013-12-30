@@ -1144,8 +1144,8 @@ int main(int argc, char **argv) {
     exit(-1);
   }
   if (!unpack) {
-    dirextents = file_extents::dir_extents_test(argv[argno]);
-    dirtree_walker w(argv[argno], handle_dent);
+    dirextents = file_extents::dir_extents_test(".");
+    dirtree_walker w(".", handle_dent);
     w.join();
     grab.coalesce();
     grab.doit();
