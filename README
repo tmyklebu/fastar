@@ -1,0 +1,110 @@
+Authors
+=======
+
+Fastar was written by Tor Myklebust and Marc Burns in 2013.
+
+Description
+===========
+
+Fastar is an archiver.  You use it to back up directory trees within file
+systems.  It copies directories regular files, device nodes, symbolic links,
+FIFOs, and Unix sockets as-is and tries to preserve hard links.
+
+Licence
+=======
+
+Copyright (c) 2013, Tor Myklebust and Marc Burns.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * The names of the authors may not be used to endorse or promote
+      products derived from this software without specific prior written
+      permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL <COPYRIGHT HOLDER> BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Building
+========
+
+You will need a C++11 compiler to compile this code.  Recent versions of gcc do
+the trick; we've used 4.7 and 4.8 with great success.  Just type
+
+    make
+
+This will produce an executable called fastar.
+
+You almost certainly need to be on Linux, since we use Linux-specific ioctls to
+help speed things up.
+
+Running
+=======
+
+Do this and you will get an archive of the current directory on stdout:
+
+    sync
+    fastar
+
+Do this if the file 'foo' contains a fastar archive that you'd like to restore
+in the current directory:
+
+    fastar -d < foo
+
+We have found the following bash incantation useful for copying the directory
+tree '/dir/tree' to a remote machine:
+
+    sync
+    (cd /dir/tree; fastar) | ssh remote-machine '(mkdir -p /dir/tree; cd /dir/tree; fastar -d)'
+
+You want to 'sync' first so that the files reside on disk so that extent
+mapping works.  If you don't, you'll get a warning like this:
+
+    warning: failed to fetch extents for ./foo: bogus extent: 7
+
+That means fastar didn't bother archiving all of ./foo.  That means you're
+going to lose data if you were expecting a complete archive.  Run sync and try
+again.
+
+Limitations
+===========
+
+We use the Linux-specific FIEMAP (extent mapping) and FIBMAP (block mapping)
+ioctls to figure out where on the disk the various parts of your files reside.
+These system calls currently fail if the file hasn't been synced to disk yet,
+since there aren't really any disk extents to speak of.  This can cause
+incomplete archival (i.e. data loss); a diagnostic warning is printed if a
+FIEMAP or FIBMAP call fails.
+
+Because we use extent and block mapping calls, we probably can't archive all
+file systems supported by Linux.  We have used fastar successfully on ext3 and
+ext4, but it is known to fail on tmpfs.
+
+We open files O_DIRECT.  If that's not OK with some of the file systems in the
+tree being archived, fastar will bomb out.  Tmpfs is one such file system.
+
+We spawn a ton of threads.  This hasn't been a problem for us yet, but it might
+be more civilised to use aio or something.
+
+Fastar won't work for archiving a directory tree that's being actively
+modified.  It might crash, bomb out with an exception, or just silently fail to
+archive some files.
+
+We think we got the extended attributes (ACLs, SELinux attributes, etc.) code
+right, but we haven't actually tested it since we weren't using an
+xattrs-enabled file system.
+
+We make no attempt to map uids and gids to names and preserve the names.  Files
+owned by uid 1234 on archival will be owned by uid 1234 on unarchival.
