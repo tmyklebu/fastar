@@ -905,6 +905,9 @@ struct data_grabber {
           }
         }
       }
+      if (eout.size())
+        newwork.push_back(make_pair(bigwork[i].first,
+            make_pair(bigwork[i].second.first, eout)));
     }
 
     // TODO: deal with small chunks belonging to the same file...somehow.
